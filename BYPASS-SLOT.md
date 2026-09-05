@@ -92,3 +92,34 @@ reverted                            -> 28 passed, 0 failed
 28 pass in 358.63 s, and under Miri the test values are `Box`, so that also
 rules out a leak or double-drop of an item held in the slot when the `Worker`
 drops. Loom 12 pass.
+
+## Correction: the loaded result is inconclusive, not negative
+
+Written 2026-09-05, after the table above.
+
+Two errors, both mine.
+
+**The ranking was wrong.** The claim that the slot "optimises the cheapest hop"
+came from comparing queue operation costs: a 6.8 ns pop against a 407 ns steal
+at p99.9. That is not the quantity that matters. When a task migrates, the cache
+lines it then touches have to come from another cluster's L2 or from SLC, and
+that is paid by the task afterwards rather than by the steal. Per migrated line
+it is far more than the 6.8 ns CAS the slot removes. Cross-core data movement is
+not the cheap part.
+
+**And the harness could not observe it.** Every core was seeded with an equal
+stripe of tiles and every chain was the same length, so the load was balanced by
+construction. In the ring arm a successor pushed to the ring is popped LIFO by
+the same core unless somebody steals it, and a balanced pool barely steals. If
+the steal count was near zero then the two arms were the same program and the
+twelve rows measured nothing about locality at all.
+
+**Steals were never counted, so this is not known either way.** That
+instrumentation is the first thing to add before this table is trusted or
+repeated. An honest test needs deliberate imbalance, so that migration actually
+happens and the slot has something to prevent.
+
+So the correct reading of this document is: the single-threaded +21.9% stands,
+and the loaded rows show no effect *in a workload where the mechanism may never
+have fired*. That is a reason to keep the branch, not a reason to conclude
+against it.

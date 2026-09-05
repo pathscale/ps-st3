@@ -116,10 +116,16 @@ pub(crate) unsafe fn transfer_items<T>(
     }
 }
 
-/// Loom fallback: loom's `UnsafeCell` exposes no raw pointers, so the
-/// transfer degenerates to the tracked per-element loop.
-#[cfg(all(test, st3_loom))]
-pub(crate) unsafe fn transfer_items<T>(
+/// The per-element reference implementation.
+///
+/// Under loom this *is* `transfer_items`: loom's `UnsafeCell` exposes no raw pointers, so
+/// the bulk path cannot be expressed there. That leaves two implementations of one contract
+/// with nothing checking they agree, which is why this is also compiled under `test` and
+/// held against the bulk version by `bulk_matches_scalar` below. A divergence between them
+/// would otherwise be invisible: loom would keep passing on the version that does not ship.
+#[cfg(any(test, st3_loom))]
+#[allow(dead_code)]
+pub(crate) unsafe fn transfer_items_scalar<T>(
     src_buffer: &[UnsafeCell<MaybeUninit<T>>],
     src_mask: UnsignedShort,
     src_pos: UnsignedShort,
@@ -133,5 +139,66 @@ pub(crate) unsafe fn transfer_items<T>(
             .with(|slot| slot.read().assume_init());
         dst_buffer[(dst_pos.wrapping_add(offset) & dst_mask) as usize]
             .with_mut(|slot| slot.write(MaybeUninit::new(item)));
+    }
+}
+
+#[cfg(all(test, st3_loom))]
+pub(crate) use self::transfer_items_scalar as transfer_items;
+
+#[cfg(all(test, not(st3_loom)))]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn buffer(n: usize) -> Vec<UnsafeCell<MaybeUninit<u32>>> {
+        (0..n)
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect()
+    }
+
+    /// The bulk transfer must move exactly what the per-element loop moves, for every
+    /// combination of ring sizes, start positions and counts that the booking step can
+    /// produce - including every wrap point, which is where a segmented copy can go wrong
+    /// and a scalar loop cannot.
+    #[test]
+    fn bulk_matches_scalar() {
+        for &src_cap in &[2usize, 4, 8, 16, 32] {
+            for &dst_cap in &[2usize, 4, 8, 16, 32] {
+                let (src_mask, dst_mask) =
+                    (src_cap as UnsignedShort - 1, dst_cap as UnsignedShort - 1);
+                for src_pos in 0..(src_cap as UnsignedShort * 2) {
+                    for dst_pos in 0..(dst_cap as UnsignedShort * 2) {
+                        for count in 0..=(src_cap.min(dst_cap) as UnsignedShort) {
+                            let src = buffer(src_cap);
+                            for i in 0..src_cap {
+                                src[i].with_mut(|s| unsafe {
+                                    s.write(MaybeUninit::new(0xC0DE_0000u32 + i as u32))
+                                });
+                            }
+                            let bulk = buffer(dst_cap);
+                            let scalar = buffer(dst_cap);
+                            unsafe {
+                                transfer_items(
+                                    &src, src_mask, src_pos, &bulk, dst_mask, dst_pos, count,
+                                );
+                                transfer_items_scalar(
+                                    &src, src_mask, src_pos, &scalar, dst_mask, dst_pos, count,
+                                );
+                            }
+                            for offset in 0..count {
+                                let idx = (dst_pos.wrapping_add(offset) & dst_mask) as usize;
+                                let a = bulk[idx].with(|s| unsafe { s.read().assume_init() });
+                                let b = scalar[idx].with(|s| unsafe { s.read().assume_init() });
+                                assert_eq!(
+                                    a, b,
+                                    "bulk and scalar disagree: src_cap={src_cap} dst_cap={dst_cap} \
+                                     src_pos={src_pos} dst_pos={dst_pos} count={count} offset={offset}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

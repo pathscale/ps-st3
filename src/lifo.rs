@@ -39,6 +39,8 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use core::alloc::Layout;
+use core::cell::Cell;
+use core::fmt;
 use core::iter::FusedIterator;
 use core::mem::{transmute, MaybeUninit};
 use core::panic::{RefUnwindSafe, UnwindSafe};
@@ -263,9 +265,16 @@ impl<T> Drop for Queue<T> {
 }
 
 /// Handle for single-threaded LIFO push and pop operations.
-#[derive(Debug)]
 pub struct Worker<T> {
     queue: Arc<Queue<T>>,
+
+    /// Core-local bypass slot, read by `pop` ahead of the ring.
+    ///
+    /// Owner-private, so no atomic is needed: `Worker` is held by one thread by
+    /// construction, and this `Cell` is what makes that `!Sync` rather than a
+    /// comment. A stealer cannot see it, which is why it holds at most one item
+    /// and why `drain_next` exists.
+    next: Cell<Option<T>>,
 }
 
 impl<T> Worker<T> {
@@ -304,7 +313,10 @@ impl<T> Worker<T> {
             mask,
         });
 
-        Worker { queue }
+        Worker {
+            queue,
+            next: Cell::new(None),
+        }
     }
 
     /// Creates a new `Stealer` handle associated to this `Worker`.
@@ -337,7 +349,72 @@ impl<T> Worker<T> {
         unsafe { transmute::<&'_ Arc<Queue<T>>, &'_ Stealer<T>>(&self.queue) }
     }
 
-    /// Returns the capacity of the queue.
+    /// Pushes an item into the core-local bypass slot, ahead of the ring.
+    ///
+    /// The next `pop` on this worker returns this item, whatever the ring
+    /// holds. Whatever the slot held before is pushed onto the ring, so nothing
+    /// is dropped and nothing stays hidden beyond a single item.
+    ///
+    /// This exists for the case where the task that just ran produced the next
+    /// one: its payload is still in L1, and going through the ring would cost a
+    /// `compare_exchange` on `pop` to get it back out.
+    ///
+    /// # Hidden from stealers
+    ///
+    /// A `Stealer` cannot reach this slot. That is the whole point, and it is
+    /// also the hazard: an item parked here on a thread that stops polling is
+    /// an item no other thread can run. Any path that is about to stop polling
+    /// must call [`drain_next`](Self::drain_next) first.
+    ///
+    /// # Errors
+    ///
+    /// Fails only if the displaced item cannot be pushed because the ring is
+    /// full, in which case `item` is returned and the slot is left as it was.
+    /// Pushes an item into the core-local bypass slot.
+    pub fn push_next(&self, item: T) -> Result<(), T> {
+        if let Some(displaced) = self.next.take() {
+            if let Err(displaced) = self.push(displaced) {
+                // Put the queue back exactly as it was before refusing.
+                self.next.set(Some(displaced));
+                return Err(item);
+            }
+        }
+        self.next.set(Some(item));
+        Ok(())
+    }
+
+    /// Moves the item held in the bypass slot onto the ring, where a stealer
+    /// can reach it. Returns true if an item was moved.
+    ///
+    /// Call this before parking, before yielding the worker, and anywhere else
+    /// this thread stops polling: an item left in the slot is invisible to
+    /// every other thread.
+    ///
+    /// If the ring is full the item stays in the slot and this returns false,
+    /// which is not a stranding hazard, because a full ring means there is work
+    /// for a stealer to find anyway.
+    pub fn drain_next(&self) -> bool {
+        match self.next.take() {
+            None => false,
+            Some(item) => match self.push(item) {
+                Ok(()) => true,
+                Err(item) => {
+                    self.next.set(Some(item));
+                    false
+                }
+            },
+        }
+    }
+
+    /// Returns true if the bypass slot holds an item.
+    pub fn has_next(&self) -> bool {
+        // `Cell::take` would move the item out, so peek without disturbing it.
+        let held = self.next.take();
+        let full = held.is_some();
+        self.next.set(held);
+        full
+    }
+    /// Returns the capacity of the ring, which does not include the bypass slot.
     pub fn capacity(&self) -> usize {
         self.queue.capacity() as usize
     }
@@ -376,7 +453,9 @@ impl<T> Worker<T> {
         let (pop_count, head) = unpack(self.queue.pop_count_and_head.load(Relaxed));
         let tail = push_count.wrapping_sub(pop_count);
 
-        tail == head
+        // A held bypass item is a poppable item, and the contract above is that a
+        // true here means the next pop fails. Checking it keeps that true.
+        tail == head && !self.has_next()
     }
 
     /// Attempts to push one item at the tail of the queue.
@@ -458,6 +537,12 @@ impl<T> Worker<T> {
     ///
     /// This returns None if the queue is empty.
     pub fn pop(&self) -> Option<T> {
+        // The bypass slot first. A predictable not-taken branch when it is empty,
+        // against a full compare_exchange on the ring path below.
+        if let Some(item) = self.next.take() {
+            return Some(item);
+        }
+
         // Acquire the item to be popped.
         //
         // Ordering: Relaxed ordering is sufficient since (i) the push and pop
@@ -539,6 +624,17 @@ impl<T> Worker<T> {
             current: old_head,
             end: new_head,
         })
+    }
+}
+
+// Derived `Debug` would demand `T: Copy`, because `Cell<Option<T>>: Debug` does.
+// The interesting state is whether the bypass slot is occupied, not what is in it.
+impl<T: fmt::Debug> fmt::Debug for Worker<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Worker")
+            .field("queue", &self.queue)
+            .field("has_next", &self.has_next())
+            .finish()
     }
 }
 

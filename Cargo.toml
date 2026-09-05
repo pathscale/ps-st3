@@ -10,7 +10,7 @@ authors = ["Serge Barral <serge.barral@asynchronics.com>"]
 edition = "2021"
 rust-version = "1.60"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pathscale/st3"
+repository = "https://github.com/pathscale/ps-st3"
 readme = "README.md"
 description = """
 A very fast lock-free, bounded, work-stealing LIFO queue.

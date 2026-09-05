@@ -620,3 +620,96 @@ macro_rules! queue_capacity {
 
 queue_capacity!(fifo, fifo_queue_capacity);
 queue_capacity!(lifo, lifo_queue_capacity);
+
+// The core-local bypass slot. It sits ahead of the ring for the owner and is
+// invisible to every stealer, so what these tests hold down is the pair of
+// claims that makes it safe: nothing is hidden except one item, and nothing is
+// hidden across a call to `drain_next`.
+
+#[test]
+fn lifo_next_jumps_the_ring() {
+    let worker = lifo::Worker::new(16);
+    worker.push(TestValue::new(1)).unwrap();
+    worker.push(TestValue::new(2)).unwrap();
+
+    worker.push_next(TestValue::new(99)).unwrap();
+
+    assert_eq!(*worker.pop().unwrap(), 99);
+    assert_eq!(*worker.pop().unwrap(), 2);
+    assert_eq!(*worker.pop().unwrap(), 1);
+    assert!(worker.pop().is_none());
+}
+
+#[test]
+fn lifo_next_displaces_onto_the_ring() {
+    let worker = lifo::Worker::new(16);
+
+    worker.push_next(TestValue::new(1)).unwrap();
+    worker.push_next(TestValue::new(2)).unwrap();
+
+    // 2 is held, 1 was pushed onto the ring rather than dropped.
+    assert_eq!(*worker.pop().unwrap(), 2);
+    assert_eq!(*worker.pop().unwrap(), 1);
+    assert!(worker.pop().is_none());
+}
+
+#[test]
+fn lifo_next_is_hidden_from_a_stealer_until_drained() {
+    let worker = lifo::Worker::new(16);
+    let stealer = worker.stealer();
+    let dest = lifo::Worker::new(16);
+
+    worker.push_next(TestValue::new(42)).unwrap();
+
+    // Held: the ring is empty as far as any other thread can tell.
+    assert_eq!(stealer.steal(&dest, |n| n).unwrap_err(), StealError::Empty);
+
+    assert!(worker.drain_next());
+    assert_eq!(stealer.steal(&dest, |n| n).unwrap(), 1);
+    assert_eq!(*dest.pop().unwrap(), 42);
+    assert!(!worker.drain_next());
+}
+
+#[test]
+fn lifo_is_empty_counts_the_held_item() {
+    let worker = lifo::Worker::<TestValue<usize>>::new(16);
+    assert!(worker.is_empty());
+
+    worker.push_next(TestValue::new(1)).unwrap();
+
+    // The documented contract is that `is_empty` true means the next `pop`
+    // fails. A held item is poppable, so the ring being empty is not enough.
+    assert!(!worker.is_empty());
+    assert!(worker.pop().is_some());
+    assert!(worker.is_empty());
+}
+
+#[test]
+fn lifo_next_refuses_rather_than_dropping_when_the_ring_is_full() {
+    let worker = lifo::Worker::new(2);
+    worker.push_next(TestValue::new(1)).unwrap();
+    worker.push(TestValue::new(2)).unwrap();
+    worker.push(TestValue::new(3)).unwrap();
+
+    // Displacing 1 needs a ring slot and there is none, so the push is refused
+    // and the slot is left exactly as it was.
+    assert_eq!(*worker.push_next(TestValue::new(4)).unwrap_err(), 4);
+    assert_eq!(*worker.pop().unwrap(), 1);
+    assert_eq!(*worker.pop().unwrap(), 3);
+    assert_eq!(*worker.pop().unwrap(), 2);
+    assert!(worker.pop().is_none());
+}
+
+#[test]
+fn lifo_next_survives_a_ring_wrap() {
+    let worker = lifo::Worker::new(4);
+    lifo_rotate(&worker, 3);
+
+    worker.push(TestValue::new(1)).unwrap();
+    worker.push_next(TestValue::new(2)).unwrap();
+    assert!(worker.drain_next());
+
+    assert_eq!(*worker.pop().unwrap(), 2);
+    assert_eq!(*worker.pop().unwrap(), 1);
+    assert!(worker.pop().is_none());
+}

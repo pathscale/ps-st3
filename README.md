@@ -1,5 +1,10 @@
 # St³ — the Stealing Static Stack
 
+> A PathScale fork of [asynchronics/st3](https://github.com/asynchronics/st3), published as
+> `ps-st3`. The library is still named `st3`, so `use st3::lifo::Worker` is unchanged.
+> It carries upstream PR #12 (bulk segmented copies on steal) ahead of a release, plus a
+> differential test holding that bulk path against the per-element reference.
+
 Lock-free, bounded, work-stealing queues with FIFO stealing and LIFO or FIFO
 semantic for the worker thread.
 
@@ -34,7 +39,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-st3 = "0.4.1"
+ps-st3 = "0.4.1"
 ```
 
 

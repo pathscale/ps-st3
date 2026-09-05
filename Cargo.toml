@@ -1,5 +1,5 @@
 [package]
-name = "st3"
+name = "ps-st3"
 # When incrementing version and releasing to crates.io:
 # - Update crate version in README.md
 # - Update CHANGELOG.md
@@ -10,7 +10,7 @@ authors = ["Serge Barral <serge.barral@asynchronics.com>"]
 edition = "2021"
 rust-version = "1.60"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/asynchronics/st3"
+repository = "https://github.com/pathscale/st3"
 readme = "README.md"
 description = """
 A very fast lock-free, bounded, work-stealing LIFO queue.
@@ -19,6 +19,11 @@ categories = ["concurrency", "data-structures"]
 keywords = ["queue", "stack", "bounded", "lock-free", "work-stealing"]
 autotests = false
 autobenches = false
+
+[lib]
+# The crate is renamed but the library is not, so `use st3::...` and the
+# `st3_loom` cfg both keep working unchanged against the fork.
+name = "st3"
 
 [dependencies]
 crossbeam-utils = { version = "0.8.14", default-features = false }

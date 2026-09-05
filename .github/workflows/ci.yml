@@ -11,7 +11,7 @@ env:
 jobs:
   check:
     name: Check
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +32,7 @@ jobs:
 
   test:
     name: Test suite
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -45,7 +45,7 @@ jobs:
 
   loom:
     name: Test suite (Loom)
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -61,7 +61,7 @@ jobs:
 
   miri:
     name: Miri
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -78,7 +78,7 @@ jobs:
       
   lints:
     name: Lints
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -96,7 +96,7 @@ jobs:
 
   docs:
     name: Docs
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4

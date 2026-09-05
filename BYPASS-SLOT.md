@@ -123,3 +123,48 @@ So the correct reading of this document is: the single-threaded +21.9% stands,
 and the loaded rows show no effect *in a workload where the mechanism may never
 have fired*. That is a reason to keep the branch, not a reason to conclude
 against it.
+
+## What a migration actually costs
+
+Measured 2026-09-05 after the correction above, because "the loaded harness had
+no locality in it" needed a number rather than a shrug.
+
+There is no working affinity API on arm64 Darwin, but placement can be
+*observed*: `TPIDR_EL0` carries the cpu id in bits 0-11 and the cluster id in
+bits 12-19. So instead of forcing placement, bucket every timed run by what
+actually happened. 16 threads, 2000 rounds, a fixed 8192 dependent loads chasing
+a random cycle through the tile so the prefetcher cannot follow, and a COLD arm
+with 96 MiB blown through the cache between warm and chase as the worst case.
+
+Nanoseconds per load, median, on an M4 Max reporting three clusters:
+
+| tile | same core | same cluster | cross cluster | COLD |
+|---|---:|---:|---:|---:|
+| 32 KiB | 1.27 | 1.37 | 1.46 | 1.55 |
+| 256 KiB | 7.56 | 7.73 | 7.82 | 8.20 |
+| 1024 KiB | 7.72 | 7.91 | 8.04 | 10.73 |
+| 8192 KiB | 9.80 | 10.23 | 10.46 | 13.41 |
+| samples | ~100 | ~790 | ~600 | 500 |
+
+Monotone in the right order at every size, with ~600 cross-cluster samples per
+row.
+
+**Migration is not free**, which is the opposite of what a first attempt with a
+sequential streaming sweep reported. That version measured 1.00x at every size,
+because a streaming read-modify-write is prefetched and cannot tell where its
+data came from. Any locality measurement using a sequential sweep is void.
+
+Cross-cluster costs **+3% to +15%** over staying put; same-cluster costs +1.5%
+to +4%, the difference being that a same-cluster move finds the line in shared
+L2 while a cross-cluster move goes out to the SLC.
+
+**The ceiling is the number that decides the design.** COLD is only 8% to 39%
+worse than perfect same-core locality. That is the whole dynamic range available
+to any locality-preserving trick on this part, and it is measured on the most
+migration-sensitive workload constructible: pure dependent loads with the
+prefetcher defeated. Real tasks compute between their loads and will see less.
+
+A bypass slot recovers the cross-cluster fraction of that, and only for the
+tasks that would actually have been stolen. That is consistent with three loaded
+harnesses failing to find it against nulls of 0.7 to 3.7%, and it is a much
+better reason to park it than "the null was bigger".

@@ -27,12 +27,32 @@ name = "st3"
 
 [dependencies]
 crossbeam-utils = { version = "0.8.14", default-features = false }
+# Only the `fanout` pool needs a lock, for the per-worker intake and for the
+# one-time handover of each deque to the thread that runs it.
+spin = { version = "0.9", default-features = false, features = [
+    "spin_mutex",
+], optional = true }
+
+[features]
+default = ["fanout"]
+
+# The work-stealing pool built on these queues. On by default: it is the reason
+# this fork exists, and `spin` with default features off pulls in nothing else.
+# Turn it off with `default-features = false` for the deques alone.
+fanout = ["dep:spin"]
+
+# The OS substrate for `fanout`: threads, parking, a clock. The pool itself is
+# `no_std` and knows nothing about any of it, so a target without an OS links
+# the pool alone and brings its own `Host`.
+host = ["fanout"]
 
 [dev-dependencies]
 criterion = "0.3"
 oorandom = "11.1"
 crossbeam-deque = "0.8"
 num_cpus = "1.13"
+# Only the floor example needs it: the std parallel option to measure against.
+orx-parallel = { version = "3.4", default-features = false, features = ["std"] }
 
 [target.'cfg(st3_loom)'.dev-dependencies]
 loom = "0.7"
@@ -48,3 +68,13 @@ harness = false
 [[test]]
 name = "integration"
 path = "tests/tests.rs"
+
+[[test]]
+name = "fanout"
+path = "tests/fanout.rs"
+required-features = ["host"]
+
+[[example]]
+name = "floor"
+path = "examples/floor.rs"
+required-features = ["host"]

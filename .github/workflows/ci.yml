@@ -43,6 +43,12 @@ jobs:
       - name: Run cargo test
         run: cargo test --release
 
+      # `fanout` is a default feature so the line above already builds the pool,
+      # but its tests need a `Host` to run against, which is what `host` adds.
+      # This is also what builds the floor example, under -Dwarnings.
+      - name: Run cargo test (fanout with a std host)
+        run: cargo test --release --features host
+
   loom:
     name: Test suite (Loom)
     runs-on: ubicloud-standard-2

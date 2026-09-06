@@ -52,6 +52,11 @@
 
 extern crate alloc;
 
+// `host` brings an operating system with it, so it brings `std`. Everything
+// else here, the queues and the pool alike, stays free of both.
+#[cfg(feature = "host")]
+extern crate std;
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -63,6 +68,8 @@ use config::{UnsignedLong, UnsignedShort};
 use crate::loom_exports::cell::UnsafeCell;
 
 mod config;
+#[cfg(feature = "fanout")]
+pub mod fanout;
 pub mod fifo;
 pub mod lifo;
 mod loom_exports;

@@ -32,7 +32,7 @@
 //! # The operating system
 //!
 //! Three methods, in [`Host`]: park, unpark, and a clock. This module is
-//! `no_std` and knows nothing else about a platform. [`StdHost`], behind the
+//! `no_std` and knows nothing else about a platform. `StdHost`, behind the
 //! `host` feature, is what those look like with a `std` to implement them.
 
 use alloc::boxed::Box;
@@ -77,12 +77,11 @@ pub type Task = Box<dyn FnOnce() + Send>;
 /// worker sleeps with a task sitting in its intake.
 ///
 /// A spin satisfies this trivially, since it never sleeps. A condition variable
-/// does not: it needs a flag beside it, which is what [`StdHost`] carries.
+/// does not: it needs a flag beside it, which is what `StdHost` carries.
 ///
 /// `park` may also return spuriously. The pool loops, so a wakeup with nothing
 /// to show for it costs one pass and nothing else.
 ///
-/// [`StdHost`]: crate::fanout::StdHost
 pub trait Host: Send + Sync {
     /// Stop consuming a core until `unpark` for this worker, or spuriously.
     fn park(&self, worker: usize);
@@ -291,8 +290,11 @@ impl Pool {
     /// it is worth checking.
     #[must_use = "a `false` here means the worker was already running and this thread did nothing"]
     pub fn run(self: &Arc<Self>, w: Runner) -> bool {
-        let Some(queue) = self.local[w.id].queue.lock().take() else {
-            return false;
+        // `let ... else` is 1.65 and this crate supports 1.60, which the queues
+        // have no reason to give up because a pool was added beside them.
+        let queue = match self.local[w.id].queue.lock().take() {
+            Some(queue) => queue,
+            None => return false,
         };
 
         let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (w.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);

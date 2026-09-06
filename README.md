@@ -42,6 +42,57 @@ Add this to your `Cargo.toml`:
 ps-st3 = "0.5.0"
 ```
 
+For the queues alone, without the pool below and without its one dependency:
+
+```toml
+[dependencies]
+ps-st3 = { version = "0.5.0", default-features = false }
+```
+
+
+## `fanout`, the pool
+
+A deque on its own is not much use, so the crate ships the pool that makes one.
+`st3::fanout` is a fixed set of workers, each owning a `lifo::Worker` taken by
+value, stealing from the others, with the operating system behind a three-method
+`Host` trait so the pool itself is still `no_std`.
+
+```rust
+use std::sync::Arc;
+use st3::fanout::{Pool, StdHost};
+
+let host = Arc::new(StdHost::new(4));
+let pool = Pool::new(4, 4096, host);
+
+// The pool does not spawn. You hand each worker a thread of your own.
+let threads: Vec<_> = (0..4)
+    .map(|id| {
+        let (pool, runner) = (pool.clone(), pool.runner(id));
+        std::thread::spawn(move || pool.run(runner))
+    })
+    .collect();
+
+pool.submit(0, Box::new(|| println!("on some worker, at some point")));
+
+pool.shut_down();
+for t in threads {
+    let _ = t.join();
+}
+```
+
+Three things it deliberately does not do. It does not spawn threads, so a caller
+can put a worker on a thread it already owns. It has no join and no completion
+signal, so a caller that needs to know when a batch finished counts for itself.
+And it does not apply backpressure: `capacity` bounds what a worker holds, not
+what a caller may hand it.
+
+Features: `fanout` is on by default and costs one dependency, `spin`, which has
+no dependencies of its own. `host` is off by default and is what links `std`,
+for the `StdHost` above.
+
+`docs/design-choices.md` records the decisions behind it, an external review of
+it, and which of that review's findings were taken.
+
 
 ## Example
 

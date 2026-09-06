@@ -39,7 +39,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ps-st3 = "0.4.1"
+ps-st3 = "0.5.0"
 ```
 
 

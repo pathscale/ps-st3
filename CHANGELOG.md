@@ -1,3 +1,19 @@
+# 0.5.0 (2026-09-06)
+
+### Added
+
+- `fanout`, a work-stealing pool built on these queues: a fixed set of workers,
+  each owning a `lifo::Worker` taken by value, stealing from each other, with the
+  operating system behind a three-method `Host` trait so the pool stays `no_std`.
+  On by default. `default-features = false` gets the queues alone.
+- `host`, off by default, a `std`-backed `Host`.
+
+### Note for existing users
+
+A minor bump rather than a patch, because the default feature set now pulls in
+`spin`. Nothing in `fifo` or `lifo` changed, so a consumer that wants only the
+queues can stay where it is or take this with `default-features = false`.
+
 # 0.4.1 (2022-12-07)
 
 - Make it possible to obtain a reference to a stealer from a worker with

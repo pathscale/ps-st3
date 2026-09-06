@@ -168,3 +168,27 @@ fn one_worker_cannot_be_run_twice() {
     pool.shut_down();
     assert!(running.join().expect("the first thread ran"));
 }
+
+/// **Fails before the identity check.** A `Runner` carries which worker it is
+/// and nothing else, so handing one to a different pool used to be accepted
+/// silently: `run` indexed *this* pool's workers by that id and took the wrong
+/// deque, with no panic and no way for the caller to notice. Two pools sharing
+/// a thread pool's worth of runners would quietly run each other's work.
+#[test]
+#[should_panic(expected = "belongs to another pool")]
+fn a_runner_from_another_pool_is_refused() {
+    let first = Pool::new(2, 64, Arc::new(StdHost::new(2)));
+    let second = Pool::new(2, 64, Arc::new(StdHost::new(2)));
+    let _ = second.run(first.runner(0));
+}
+
+/// **Fails before the bounds check.** `runner` took any integer, so an id past
+/// the end of the pool was accepted and became an index-out-of-bounds panic
+/// inside `run`, on another thread, pointing at the pool's internals rather
+/// than at the caller's mistake.
+#[test]
+#[should_panic(expected = "worker 99 of a pool with 4")]
+fn a_runner_for_a_worker_that_does_not_exist_is_refused() {
+    let pool = Pool::new(4, 64, Arc::new(StdHost::new(4)));
+    let _ = pool.runner(99);
+}

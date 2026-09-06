@@ -1,4 +1,6 @@
-//! A `std`-backed [`Host`](crate::Host), behind the `host` feature.
+//! A `std`-backed [`Host`], behind the `host` feature.
+//!
+//! [`Host`]: super::Host
 //!
 //! The core of this crate knows nothing about an operating system: three
 //! methods, `park`, `unpark` and `now_ns`. This is what those look like when

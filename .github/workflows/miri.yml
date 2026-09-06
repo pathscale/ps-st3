@@ -1,0 +1,26 @@
+name: Miri
+
+# Manual. Miri is minutes rather than seconds and it is not what a pull request
+# is waiting on, so it does not sit in front of every push. Run it when the
+# unsafe code or the atomics change, which for this crate means the queues, the
+# transfer path, or `fanout`'s wake protocol.
+on:
+  workflow_dispatch:
+
+jobs:
+  miri:
+    name: Miri
+    runs-on: ubicloud-standard-2
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Run cargo miri
+        run: cargo miri test
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance

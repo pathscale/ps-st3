@@ -1,36 +1,61 @@
 name: Publish
 
 # House scheme: a version bump on the default branch is the release. No tags,
-# no manual step. Publishing is irreversible, so the trigger has to be
-# something you cannot do by accident, and editing the version field is that.
+# no manual step. Publishing is irreversible, so the trigger has to be something
+# you cannot do by accident, and editing the version field is that.
+#
+# What this asks is "is this version on crates.io yet", not "did the last commit
+# change Cargo.toml". The earlier version asked the second question, by diffing
+# `HEAD` against `HEAD^`, and that is only the same question when the bump is the
+# final commit of the push. A pull request merged as a series puts the bump
+# anywhere in it, so `HEAD^` reads the same version, and the job then reports
+# success having published nothing. 0.5.0 was lost exactly that way.
+#
+# It also runs on every push rather than only when `Cargo.toml` is touched.
+# Asking the registry is idempotent, so the cost of an extra run is one HTTP
+# request, and the cost of a missed one is a release that silently did not
+# happen.
 on:
   push:
     branches: [main]
-    paths: ['Cargo.toml']
+  workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
 
       - id: version
+        name: Is this version already published
         run: |
           new=$(sed -nE '0,/^version = "(.*)"/s//\1/p' Cargo.toml)
-          old=$(git show HEAD^:Cargo.toml | sed -nE '0,/^version = "(.*)"/s//\1/p')
-          if [ "$new" = "$old" ]; then
-            echo "version unchanged at $new, nothing to publish"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "version $old -> $new"
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A 'ps-st3-release (github actions)' \
+            "https://crates.io/api/v1/crates/ps-st3/$new")
+          case "$code" in
+            404)
+              echo "$new is not on crates.io, releasing it"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              ;;
+            200)
+              echo "$new is already on crates.io, nothing to do"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # Neither published nor unpublished, so far as this can tell.
+              # Failing is the only honest answer: the whole point of this
+              # rewrite is that a green job must not mean "did nothing".
+              echo "crates.io answered $code for version $new, refusing to guess"
+              exit 1
+              ;;
+          esac
 
-      # The gate runs on this commit too, but a release must not depend on job
-      # ordering, so it is re-run here rather than assumed.
+      # The gate ran on this commit already, but a release must not depend on
+      # job ordering, so it is re-run here rather than assumed. `--features
+      # host` because that is what runs the pool's own tests; without it this
+      # would publish having tested only the queues.
       - if: steps.version.outputs.changed == 'true'
         run: cargo test --release --features host
 

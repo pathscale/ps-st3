@@ -32,7 +32,7 @@ jobs:
       # The gate runs on this commit too, but a release must not depend on job
       # ordering, so it is re-run here rather than assumed.
       - if: steps.version.outputs.changed == 'true'
-        run: cargo test --release
+        run: cargo test --release --features host
 
       - if: steps.version.outputs.changed == 'true'
         run: cargo publish --token "$CARGO_REGISTRY_TOKEN"

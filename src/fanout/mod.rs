@@ -231,6 +231,10 @@ impl Pool {
 
     /// How many tasks a worker has finished.
     #[must_use]
+    // Useless on a target with 64-bit atomics, where `UnsignedLong` is already
+    // `u64`, and load-bearing on one without, where it is `u32`. Clippy sees
+    // only the target it is run on.
+    #[allow(clippy::useless_conversion)]
     pub fn completed(&self, id: usize) -> u64 {
         // The counter is the crate's conditional atomic, so it is 32-bit on a
         // target without 64-bit atomics. The public answer is a `u64` either

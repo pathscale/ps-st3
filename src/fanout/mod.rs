@@ -40,7 +40,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::config::{AtomicUnsignedLong, UnsignedLong};
+use crate::config::AtomicUnsignedLong;
 use crossbeam_utils::CachePadded;
 
 use crate::lifo::{Stealer, Worker as Queue};
@@ -231,8 +231,12 @@ impl Pool {
 
     /// How many tasks a worker has finished.
     #[must_use]
-    pub fn completed(&self, id: usize) -> UnsignedLong {
-        self.local[id].completed.load(Ordering::Relaxed)
+    pub fn completed(&self, id: usize) -> u64 {
+        // The counter is the crate's conditional atomic, so it is 32-bit on a
+        // target without 64-bit atomics. The public answer is a `u64` either
+        // way: `UnsignedLong` is `pub(crate)` and has no business in a
+        // signature a caller has to name.
+        u64::from(self.local[id].completed.load(Ordering::Relaxed))
     }
 
     /// Hand a task to a worker.

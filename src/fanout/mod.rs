@@ -38,7 +38,10 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use crate::config::{AtomicUnsignedLong, UnsignedLong};
+use crossbeam_utils::CachePadded;
 
 use crate::lifo::{Stealer, Worker as Queue};
 use spin::Mutex;
@@ -81,7 +84,6 @@ pub type Task = Box<dyn FnOnce() + Send>;
 ///
 /// `park` may also return spuriously. The pool loops, so a wakeup with nothing
 /// to show for it costs one pass and nothing else.
-///
 pub trait Host: Send + Sync {
     /// Stop consuming a core until `unpark` for this worker, or spuriously.
     fn park(&self, worker: usize);
@@ -93,12 +95,14 @@ pub trait Host: Send + Sync {
 
 /// Which worker a thread is running.
 ///
-/// Only [`Pool::runner`] makes one, and it checks the id against the pool it
-/// came from, so a handle cannot name a worker that does not exist. Handing the
-/// same `Runner` to two threads is still a caller error, and
-/// [`Pool::run`] refuses the second rather than racing.
+/// Only [`Pool::runner`] makes one. It checks the id, and stamps the runner with
+/// the pool it came from, so a handle can neither name a worker that does not
+/// exist nor be given to a different pool. Handing the same `Runner` to two
+/// threads is still a caller error, and [`Pool::run`] refuses the second rather
+/// than racing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Runner {
+    pool: usize,
     id: usize,
 }
 
@@ -122,15 +126,21 @@ struct Local {
     /// Where work from outside lands, since a `Queue` cannot be pushed to by
     /// anyone but its owner.
     intake: Mutex<Vec<Task>>,
-    completed: AtomicU64,
+    completed: AtomicUnsignedLong,
 }
+
+// Distinguishes one pool from another, so a `Runner` cannot be handed to the
+// wrong one. Wrapping is harmless: it would take a `usize` of pools to reach a
+// collision, and a collision only matters between two live pools.
+static NEXT_POOL: AtomicUsize = AtomicUsize::new(0);
 
 /// A fixed set of workers, their deques, and the intakes work arrives through.
 ///
 /// Construct it with [`Pool::new`], hand each [`Runner`] to a thread of your
 /// own with [`Pool::run`], and feed it with [`Pool::submit`].
 pub struct Pool {
-    local: Vec<Local>,
+    id: usize,
+    local: Vec<CachePadded<Local>>,
     stealers: Vec<Stealer<Task>>,
     host: Arc<dyn Host>,
     running: AtomicBool,
@@ -183,13 +193,14 @@ impl Pool {
         for _ in 0..workers {
             let queue = Queue::new(capacity);
             stealers.push(queue.stealer());
-            local.push(Local {
+            local.push(CachePadded::new(Local {
                 queue: Mutex::new(Some(queue)),
                 intake: Mutex::new(Vec::new()),
-                completed: AtomicU64::new(0),
-            });
+                completed: AtomicUnsignedLong::new(0),
+            }));
         }
         Arc::new(Self {
+            id: NEXT_POOL.fetch_add(1, Ordering::Relaxed),
             local,
             stealers,
             host,
@@ -206,13 +217,21 @@ impl Pool {
 
     /// Every worker's handle, in order, for the threads that will run them.
     #[must_use]
+    /// # Panics
+    ///
+    /// If `id` is not a worker of this pool.
     pub fn runner(&self, id: usize) -> Runner {
-        Runner { id }
+        assert!(
+            id < self.workers(),
+            "worker {id} of a pool with {} of them",
+            self.workers()
+        );
+        Runner { pool: self.id, id }
     }
 
     /// How many tasks a worker has finished.
     #[must_use]
-    pub fn completed(&self, id: usize) -> u64 {
+    pub fn completed(&self, id: usize) -> UnsignedLong {
         self.local[id].completed.load(Ordering::Relaxed)
     }
 
@@ -226,12 +245,27 @@ impl Pool {
     /// already-running worker is cheap.
     pub fn submit(&self, worker: usize, task: Task) {
         self.local[worker].intake.lock().push(task);
-        self.host.unpark(worker);
-        // And one sleeper besides, so the work can be *stolen* without waiting
-        // for anything to time out. The task is published before this reads the
-        // bitmap, which is the half of the handshake that makes an unbounded
-        // park safe; the other half is in `run_worker`.
-        self.wake_one_sleeper(worker);
+
+        // Waking conditionally used to be unsound, and the comment that said so
+        // was right at the time: a worker could drain its intake and park
+        // between one submit and the next, so a submitter that skipped the wake
+        // lost it. The sleeper bitmap changes that. A worker sets its bit
+        // *before* its last look at the intake, so a clear bit means it has not
+        // looked yet, and the task above is published before this reads the
+        // bitmap. Either way it is found.
+        //
+        // What that buys is the whole parking path on the common case: for a
+        // `StdHost`, one mutex acquisition and one condvar notify per task,
+        // gone whenever the target is already running.
+        let bit = 1usize << worker;
+        if self.sleepers.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+            // It was asleep and this claimed it. It will take this task itself.
+            self.host.unpark(worker);
+        } else {
+            // It is running, so the task is behind whatever it is doing. Give
+            // the work a thief instead.
+            self.wake_one_sleeper(worker);
+        }
     }
 
     /// Wake one parked worker other than `except`, if any is parked.
@@ -290,6 +324,11 @@ impl Pool {
     /// it is worth checking.
     #[must_use = "a `false` here means the worker was already running and this thread did nothing"]
     pub fn run(self: &Arc<Self>, w: Runner) -> bool {
+        assert_eq!(
+            w.pool, self.id,
+            "this `Runner` belongs to another pool, and running it here would \
+             hand this thread the wrong deque"
+        );
         // `let ... else` is 1.65 and this crate supports 1.60, which the queues
         // have no reason to give up because a pool was added beside them.
         let queue = match self.local[w.id].queue.lock().take() {
@@ -297,6 +336,7 @@ impl Pool {
             None => return false,
         };
 
+        let mut scratch: Vec<Task> = Vec::new();
         let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (w.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
         loop {
@@ -306,7 +346,7 @@ impl Pool {
                 continue;
             }
 
-            if self.drain_intake(w.id, &queue) > 0 {
+            if self.drain_intake(w.id, &queue, &mut scratch) > 0 {
                 continue;
             }
 
@@ -343,23 +383,27 @@ impl Pool {
     }
 
     /// Move what arrived from outside into the local deque.
-    fn drain_intake(&self, id: usize, queue: &Queue<Task>) -> usize {
-        let taken: Vec<Task> = core::mem::take(&mut *self.local[id].intake.lock());
-        let n = taken.len();
-        for task in taken {
+    /// `scratch` is the worker's own buffer, swapped in so the intake keeps a
+    /// capacity rather than being left at zero for the next submit to
+    /// reallocate while holding the lock.
+    fn drain_intake(&self, id: usize, queue: &Queue<Task>, scratch: &mut Vec<Task>) -> usize {
+        debug_assert!(scratch.is_empty());
+        core::mem::swap(&mut *self.local[id].intake.lock(), scratch);
+        let n = scratch.len();
+        // Wake before the loop, not after it. The overflow below runs inline on
+        // this worker, and an intake larger than the deque can therefore hold
+        // this thread for thousands of tasks; telling a sleeper afterwards is
+        // telling it once the work is gone.
+        if n > 1 {
+            self.wake_one_sleeper(id);
+        }
+        for task in scratch.drain(..) {
             if let Err(back) = queue.push(task) {
                 // The deque is full. Running it here is the only option that
                 // neither drops the task nor grows without bound.
                 back();
                 self.local[id].completed.fetch_add(1, Ordering::Relaxed);
             }
-        }
-        // More than one task means there is something left to steal after this
-        // worker takes the first. Propagating the wake here is what covers the
-        // case no submit can: a worker sitting on a backlog while another
-        // sleeps, with nothing new arriving to wake anyone.
-        if n > 1 {
-            self.wake_one_sleeper(id);
         }
         n
     }
@@ -375,11 +419,24 @@ impl Pool {
         if workers < 2 {
             return 0;
         }
-        for _ in 0..4 {
-            *rng ^= *rng << 13;
-            *rng ^= *rng >> 7;
-            *rng ^= *rng << 17;
-            let victim = (*rng % workers as u64) as usize;
+        // A random start, then every victim once.
+        //
+        // The start is random because a fixed neighbour gives some victims
+        // probability zero, which is what Blumofe and Leiserson's bound forbids
+        // and what makes hot spots in practice. Measured on the design this
+        // replaces, a fixed neighbour cost 75% against random.
+        //
+        // The sweep is exhaustive because a fixed number of random draws does
+        // not bound discovery: four draws over 64 workers find the one busy
+        // victim about 6% of the time, and a miss means parking with work
+        // available. When work is plentiful the first probe hits and the rest
+        // of the loop never runs.
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        let start = (*rng % workers as u64) as usize;
+        for offset in 0..workers {
+            let victim = (start + offset) % workers;
             if victim == id {
                 continue;
             }

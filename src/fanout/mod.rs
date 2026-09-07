@@ -185,6 +185,13 @@ pub struct Pool {
     host: Arc<dyn Host>,
     running: AtomicBool,
     tuning: Tuning,
+    /// How many workers are hunting for work right now.
+    ///
+    /// A submit with a searcher already out wakes nobody: that searcher will
+    /// find the task, and waking a second worker only adds a mutex, a condvar
+    /// notify and another prober. This is what makes a submit cheap while the
+    /// pool is busy, which is when submits happen.
+    searching: AtomicUsize,
     /// One bit per worker, set while that worker is parked or about to park.
     ///
     /// This exists because nothing else can tell a sleeping worker that work
@@ -261,6 +268,7 @@ impl Pool {
             host,
             running: AtomicBool::new(true),
             tuning,
+            searching: AtomicUsize::new(0),
             sleepers: AtomicUsize::new(0),
         })
     }
@@ -332,6 +340,12 @@ impl Pool {
         // ordered against publishing the task above, or a worker that sets its
         // bit and then looks at the intake could be missed by a submitter that
         // read the bitmap before the bit appeared.
+        // A searcher already out will find this task, so waking anyone is
+        // pure cost: a mutex, a condvar notify, and one more prober competing
+        // with the worker that is about to take the work anyway.
+        if self.searching.load(Ordering::SeqCst) > 0 {
+            return;
+        }
         let bit = 1usize << worker;
         if self.sleepers.load(Ordering::SeqCst) == 0 {
             return;
@@ -353,8 +367,29 @@ impl Pool {
     /// Clearing it also means an unpark is never sent twice for one sleep, and
     /// `Host::unpark` leaves a permit anyway, so a wake that arrives before the
     /// park is not lost.
+    /// Take a hunting slot, if one is free.
+    fn start_searching(&self) -> bool {
+        let searching = self.searching.load(Ordering::SeqCst);
+        if 2 * searching >= self.workers() {
+            return false;
+        }
+        self.searching.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Give the slot back, and wake somebody if this was the last hunter.
+    ///
+    /// The last one matters: while a searcher is out, submits skip their wake
+    /// and rely on it. When it stops, somebody has to take over or a task can
+    /// sit in an intake with every worker asleep.
+    fn stopped_searching(&self) {
+        if self.searching.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.wake_one_sleeper(usize::MAX);
+        }
+    }
+
     fn wake_one_sleeper(&self, except: usize) {
-        let mut parked = self.sleepers.load(Ordering::SeqCst) & !(1usize << except);
+        let mut parked = self.sleepers.load(Ordering::SeqCst) & !(if except == usize::MAX { 0 } else { 1usize << except });
         while parked != 0 {
             let candidate = parked.trailing_zeros() as usize;
             let bit = 1usize << candidate;
@@ -415,39 +450,39 @@ impl Pool {
         };
 
         let mut scratch: Vec<Task> = Vec::new();
-        let mut spins = 0u32;
+        // Whether this worker is counted in `searching`.
+        let mut searching = false;
         let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (w.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
         loop {
             if let Some(task) = queue.pop() {
-                spins = 0;
+                if searching {
+                    searching = false;
+                    self.stopped_searching();
+                }
                 task();
                 self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
             if self.drain_intake(w.id, &queue, &mut scratch) > 0 {
-                spins = 0;
-                continue;
-            }
-
-            if self.steal_once(&queue, w.id, &mut rng) > 0 {
-                spins = 0;
-                continue;
-            }
-
-            // Nothing found this round. Look again before announcing anything:
-            // see `Tuning::rounds_before_park` for why the wake, not the park, costs.
-            if spins < self.tuning.rounds_before_park {
-                spins += 1;
-                // Back off *without* touching anything shared. Looking again
-                // means locking this worker's intake and probing every other
-                // worker's queue, so an empty round is not free to anyone
-                // else: repeating it immediately is what starves the producer
-                // this is trying to keep fed.
-                for _ in 0..self.tuning.backoff_spins {
-                    core::hint::spin_loop();
+                if searching {
+                    searching = false;
+                    self.stopped_searching();
                 }
+                continue;
+            }
+
+            // Only some of the workers may hunt at once. The rest park, and a
+            // searcher that finds work wakes one of them. Without this cap
+            // every idle worker probes every other worker's queue, which is
+            // the contention this avoids rather than pays.
+            if !searching {
+                searching = self.start_searching();
+            }
+            if searching && self.steal_once(&queue, w.id, &mut rng) > 0 {
+                searching = false;
+                self.stopped_searching();
                 continue;
             }
 
@@ -470,8 +505,11 @@ impl Pool {
                 self.sleepers.fetch_and(!bit, Ordering::SeqCst);
                 break;
             }
+            if searching {
+                searching = false;
+                self.searching.fetch_sub(1, Ordering::SeqCst);
+            }
             self.host.park(w.id);
-            spins = 0;
             self.sleepers.fetch_and(!bit, Ordering::SeqCst);
         }
 
@@ -538,9 +576,28 @@ impl Pool {
             if victim == id {
                 continue;
             }
-            let got = self.stealers[victim]
+            let mut got = self.stealers[victim]
                 .steal(queue, |n| (n.min(PULL_BATCH) + 1) / 2)
                 .unwrap_or(0);
+
+            // A victim's deque is only half of where its work can be. A submit
+            // lands in an *intake*, and until that worker drains it nothing in
+            // there is reachable by anyone else: a thief that only probes
+            // deques walks past the work and parks. That is what made
+            // "a searcher will find it" false here, where it is true for a
+            // runtime whose submits go to a shared queue.
+            if got == 0 {
+                if let Some(mut intake) = self.local[victim].intake.try_lock() {
+                    let take = (intake.len().min(PULL_BATCH) + 1) / 2;
+                    for task in intake.drain(..take) {
+                        if let Err(back) = queue.push(task) {
+                            back();
+                            self.local[id].completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        got += 1;
+                    }
+                }
+            }
             if got > 0 {
                 // A thief that took more than one has spare work of its own
                 // now, so the chain continues: one more sleeper joins in.

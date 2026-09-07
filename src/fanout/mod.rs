@@ -265,7 +265,21 @@ impl Pool {
         // What that buys is the whole parking path on the common case: for a
         // `StdHost`, one mutex acquisition and one condvar notify per task,
         // gone whenever the target is already running.
+        // Read before writing. Every submit used to take this line
+        // exclusively with an RMW, and the line is shared by every worker
+        // parking and waking, so the wake bookkeeping serialised the whole
+        // pool: 110 ns a task at one worker became 1,380 ns at eight. When
+        // nobody is asleep - the throughput case - the bitmap is zero and a
+        // load answers the question.
+        //
+        // The load is `SeqCst` for the same reason the RMW was: it has to be
+        // ordered against publishing the task above, or a worker that sets its
+        // bit and then looks at the intake could be missed by a submitter that
+        // read the bitmap before the bit appeared.
         let bit = 1usize << worker;
+        if self.sleepers.load(Ordering::SeqCst) == 0 {
+            return;
+        }
         if self.sleepers.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
             // It was asleep and this claimed it. It will take this task itself.
             self.host.unpark(worker);

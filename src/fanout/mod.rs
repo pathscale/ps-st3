@@ -60,6 +60,20 @@ pub use host::StdHost;
 /// victim.
 pub const PULL_BATCH: usize = 32;
 
+/// Empty rounds a worker takes before it announces sleep.
+///
+/// Parking is not expensive to the parker; it is expensive to whoever has to
+/// wake it, because a wake is a mutex and a condvar notify. A worker that
+/// parks the moment its queue runs dry makes every later submit pay one, and
+/// at eight workers that was 0.95 parks a task: the producer became the
+/// bottleneck, and the starvation that caused made the workers park again.
+///
+/// A steady stream refills within a few hundred cycles, so looking again a few
+/// times skips the protocol entirely. Swept at 16, 64, 256 and 1024 empty
+/// rounds over 100,000 tasks and 8 workers: 445, 353, 372 and 365 ns a task.
+/// Past a few dozen it stops mattering.
+const SPINS_BEFORE_PARK: u32 = 64;
+
 /// A unit of work.
 ///
 /// Independent by construction: no join, no continuation, no completion
@@ -359,20 +373,32 @@ impl Pool {
         };
 
         let mut scratch: Vec<Task> = Vec::new();
+        let mut spins = 0u32;
         let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (w.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
         loop {
             if let Some(task) = queue.pop() {
+                spins = 0;
                 task();
                 self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
             if self.drain_intake(w.id, &queue, &mut scratch) > 0 {
+                spins = 0;
                 continue;
             }
 
             if self.steal_once(&queue, w.id, &mut rng) > 0 {
+                spins = 0;
+                continue;
+            }
+
+            // Nothing found this round. Look again before announcing anything:
+            // see `SPINS_BEFORE_PARK` for why the wake, not the park, costs.
+            if spins < SPINS_BEFORE_PARK {
+                spins += 1;
+                core::hint::spin_loop();
                 continue;
             }
 
@@ -396,6 +422,7 @@ impl Pool {
                 break;
             }
             self.host.park(w.id);
+            spins = 0;
             self.sleepers.fetch_and(!bit, Ordering::SeqCst);
         }
 

@@ -60,6 +60,29 @@ pub use host::StdHost;
 /// victim.
 pub const PULL_BATCH: usize = 32;
 
+/// What a worker does when it finds no work, and for how long.
+///
+/// These are policy, not mechanism: the right values depend on how fast work
+/// arrives and on what else is running, so they are a parameter rather than a
+/// constant. [`Tuning::default`] is what was measured here, and the numbers
+/// that justify each field are on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Tuning {
+    /// Empty rounds a worker takes before it announces sleep.
+    pub rounds_before_park: u32,
+    /// How long to wait between two empty rounds, in spin-loop hints.
+    pub backoff_spins: u32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            rounds_before_park: ROUNDS_BEFORE_PARK,
+            backoff_spins: BACKOFF_SPINS,
+        }
+    }
+}
+
 /// Empty rounds a worker takes before it announces sleep.
 ///
 /// Parking is not expensive to the parker; it is expensive to whoever has to
@@ -72,7 +95,10 @@ pub const PULL_BATCH: usize = 32;
 /// times skips the protocol entirely. Swept at 16, 64, 256 and 1024 empty
 /// rounds over 100,000 tasks and 8 workers: 445, 353, 372 and 365 ns a task.
 /// Past a few dozen it stops mattering.
-const SPINS_BEFORE_PARK: u32 = 64;
+const ROUNDS_BEFORE_PARK: u32 = 64;
+
+/// How long to wait between two empty rounds.
+const BACKOFF_SPINS: u32 = 64;
 
 /// A unit of work.
 ///
@@ -158,6 +184,7 @@ pub struct Pool {
     stealers: Vec<Stealer<Task>>,
     host: Arc<dyn Host>,
     running: AtomicBool,
+    tuning: Tuning,
     /// One bit per worker, set while that worker is parked or about to park.
     ///
     /// This exists because nothing else can tell a sleeping worker that work
@@ -197,6 +224,20 @@ impl Pool {
     /// workers the wake bitmap can name.
     #[must_use]
     pub fn new(workers: usize, capacity: usize, host: Arc<dyn Host>) -> Arc<Self> {
+        Self::with_tuning(workers, capacity, host, Tuning::default())
+    }
+
+    /// A pool whose idle behaviour is the caller's to choose.
+    ///
+    /// See [`Tuning`]. The default is what was measured on this machine and is
+    /// not a claim about any other.
+    #[must_use]
+    pub fn with_tuning(
+        workers: usize,
+        capacity: usize,
+        host: Arc<dyn Host>,
+        tuning: Tuning,
+    ) -> Arc<Self> {
         assert!(
             workers <= usize::BITS as usize,
             "a pool is one bit per worker in a usize: {workers} workers is more than {} ",
@@ -219,6 +260,7 @@ impl Pool {
             stealers,
             host,
             running: AtomicBool::new(true),
+            tuning,
             sleepers: AtomicUsize::new(0),
         })
     }
@@ -395,10 +437,17 @@ impl Pool {
             }
 
             // Nothing found this round. Look again before announcing anything:
-            // see `SPINS_BEFORE_PARK` for why the wake, not the park, costs.
-            if spins < SPINS_BEFORE_PARK {
+            // see `Tuning::rounds_before_park` for why the wake, not the park, costs.
+            if spins < self.tuning.rounds_before_park {
                 spins += 1;
-                core::hint::spin_loop();
+                // Back off *without* touching anything shared. Looking again
+                // means locking this worker's intake and probing every other
+                // worker's queue, so an empty round is not free to anyone
+                // else: repeating it immediately is what starves the producer
+                // this is trying to keep fed.
+                for _ in 0..self.tuning.backoff_spins {
+                    core::hint::spin_loop();
+                }
                 continue;
             }
 

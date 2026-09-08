@@ -16,31 +16,43 @@ use super::Host;
 
 /// Futex parking, one word per worker.
 ///
-/// **No mutex and no condition variable.** The pool wakes a worker on the hot
-/// path, and a condvar wake is a mutex acquisition, a signal and a release even
-/// when nobody is on the other end. This is one atomic word per worker, and a
-/// wake with nobody asleep is a store and a load with no system call at all.
+/// # Where this came from
+///
+/// The three-state protocol below is `forte`'s `Semaphore` (`src/latch.rs`,
+/// MIT OR Apache-2.0, the same licence as this crate), ported because it is
+/// better than what was here and there is no point pretending otherwise. What
+/// makes it better is one observation:
+///
+/// **Both sides swap the same word, and modification order on a single atomic
+/// is total even under `Relaxed`.** So there is no store-load race to close and
+/// no `SeqCst` to pay for it. The protocol this replaces used a pool-wide
+/// bitmap of who was asleep, which is a different word from the queue, so it
+/// *did* need `SeqCst`, and every park attempt and every submit hit that one
+/// cache line with a read-modify-write. Measured: parking sooner made the pool
+/// spend *more* CPU, up to 818 ms against 445, because the bookkeeping cost
+/// more than the sleep saved.
 #[derive(Debug)]
 pub struct StdHost {
     slots: Vec<CachePadded<Slot>>,
     origin: Instant,
-    /// How many times a park woke with no permit to show for it.
+    /// How many parks woke with no signal to show for it.
     spurious: AtomicU64,
 }
 
 /// One worker's park word.
 ///
-/// `PARKED` means a thread is, or is about to be, blocked on this address.
-/// `PERMIT` means a wake arrived and the next park must consume it rather than
-/// sleep, which is the invariant [`Host`] requires.
+/// * `LOCKED` is running, and no signal outstanding.
+/// * `ASLEEP` is blocked, or about to block, on this address.
+/// * `SIGNAL` is a permit left by an unpark, which the next park consumes
+///   instead of sleeping. That is the invariant [`Host`] requires.
 #[derive(Debug, Default)]
 struct Slot {
-    word: AtomicU32,
+    state: AtomicU32,
 }
 
-const RUNNING: u32 = 0;
-const PARKED: u32 = 1;
-const PERMIT: u32 = 2;
+const LOCKED: u32 = 0;
+const SIGNAL: u32 = 1;
+const ASLEEP: u32 = 2;
 
 impl StdHost {
     #[must_use]
@@ -55,11 +67,10 @@ impl StdHost {
         }
     }
 
-    /// How many parks woke with no permit to show for it.
+    /// How many parks woke with no signal to show for it.
     ///
-    /// The platform is allowed to return from a wait for its own reasons; the
-    /// pool loops, so one costs a pass and nothing else. A number climbing
-    /// under load means something is waking workers that has no work for them.
+    /// The platform may return from a wait for its own reasons; the pool loops,
+    /// so one costs a pass and nothing else.
     #[must_use]
     pub fn spurious(&self) -> u64 {
         self.spurious.load(Ordering::Relaxed)
@@ -68,10 +79,8 @@ impl StdHost {
     /// How many parks ended in a timeout rather than a wake.
     ///
     /// Always zero: parking has no timeout any more. It had one as a backstop
-    /// against a wake going missing, from a time when the pool did not wake its
-    /// own sleepers and the timeout *was* the discovery mechanism. The pool
-    /// wakes them now and `shut_down` unparks every worker, so the backstop
-    /// guarded nothing and cost a wakeup per worker per 100 ms on an idle pool.
+    /// from a time when the pool did not wake its own sleepers and the timeout
+    /// *was* how stealable work got discovered.
     #[must_use]
     #[deprecated(since = "0.6.0", note = "parking no longer times out; see `spurious`")]
     pub fn timeouts(&self) -> u64 {
@@ -91,47 +100,41 @@ impl Host for StdHost {
     /// milliseconds is short enough that such a bug costs latency rather than a
     /// hang, and long enough that idling is free.
     fn park(&self, worker: usize) {
-        let word = &self.slots[worker].word;
-        // Claim a permit left by a wake that arrived first, and do not sleep.
-        if word.swap(RUNNING, Ordering::AcqRel) == PERMIT {
+        let state = &self.slots[worker].state;
+        // Announce sleep and read what was there in one operation. `Relaxed` is
+        // enough: this and `unpark` swap the same word, and a single atomic's
+        // modification order is total whatever the ordering asks for, so one of
+        // the two always sees the other.
+        if state.swap(ASLEEP, Ordering::Relaxed) != LOCKED {
+            // A signal arrived first. Take it and do not sleep.
+            state.store(LOCKED, Ordering::Relaxed);
             return;
         }
-        // Announce, then look once more. A wake landing between the two sees
-        // `PARKED` and calls `wake_one`, which is not lost: this thread is
-        // either already waiting, or about to wait on a word that no longer
-        // reads `PARKED` and so returns at once.
-        if word
-            .compare_exchange(RUNNING, PARKED, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            word.store(RUNNING, Ordering::Release);
-            return;
-        }
-
-        // **No timeout.** There used to be one, at 100 ms, as a backstop
-        // against a wake going missing. It is not needed: `Pool` sets a
-        // worker's sleeper bit before its last look for work, so a submit
-        // either publishes before that look or reads a bitmap with the bit
-        // already set and unparks; and `shut_down` unparks every worker. What
-        // the timeout did cost was a wakeup per worker per 100 ms forever on a
-        // pool with nothing to do.
-        while word.load(Ordering::Acquire) == PARKED {
-            atomic_wait::wait(word, PARKED);
-            if word.load(Ordering::Acquire) == PARKED {
+        // **No timeout.** `Pool` publishes work and then unparks, and
+        // `shut_down` unparks every worker, so a wake is never lost; the
+        // timeout this used to have cost a wakeup per worker per 100 ms on a
+        // pool with nothing to do and guarded nothing.
+        while state.load(Ordering::Acquire) == ASLEEP {
+            atomic_wait::wait(state, ASLEEP);
+            if state.load(Ordering::Acquire) == ASLEEP {
                 self.spurious.fetch_add(1, Ordering::Relaxed);
             }
         }
-        word.store(RUNNING, Ordering::Release);
+        state.store(LOCKED, Ordering::Relaxed);
     }
 
     fn unpark(&self, worker: usize) {
-        let word = &self.slots[worker].word;
+        let state = &self.slots[worker].state;
         // Leave a permit whatever the state was, because `Host` requires an
-        // unpark that arrives before the park to make that park return at once.
-        if word.swap(PERMIT, Ordering::AcqRel) == PARKED {
-            // Somebody is on the address, so this costs a system call. Nothing
-            // was asleep in the other cases and this is a single swap.
-            atomic_wait::wake_one(word);
+        // unpark arriving before the park to make that park return at once.
+        //
+        // **The system call happens only when somebody is actually on the
+        // address.** Signalling a running worker is this one swap: no syscall,
+        // no lock, and no shared line except that worker's own, which is
+        // padded. That is what lets `Pool` unpark on every submit without
+        // asking first who is asleep.
+        if state.swap(SIGNAL, Ordering::Release) == ASLEEP {
+            atomic_wait::wake_one(state);
         }
     }
 

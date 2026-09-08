@@ -249,17 +249,16 @@ pub struct Pool {
     host: Arc<dyn Host>,
     running: AtomicBool,
     tuning: Tuning,
-    /// Round-robin cursor for choosing which sleeper a hintless submit wakes.
+    /// Round-robin cursor for choosing which worker a hintless submit nudges.
     next_hint: AtomicUsize,
-    /// One bit per worker, set while that worker is parked or about to park.
+    /// How many workers are asleep right now.
     ///
-    /// This exists because nothing else can tell a sleeping worker that work
-    /// landed somewhere it could steal from. `submit` only knows to unpark the
-    /// worker it was given. Without this bitmap the only way a parked worker
-    /// ever discovered stealable work was for its park to time out, which made
-    /// the timeout the notification mechanism and cost 10% of a core on a pool
-    /// with nothing to do.
-    sleepers: AtomicUsize,
+    /// **Not the wake mechanism**, which is per-worker and needs no shared
+    /// state; this is only so a worker can skip sharing its private queue when
+    /// there is nobody to share with. It is `Relaxed` and touched only when a
+    /// worker actually parks or wakes, which the backoff makes rare, so it is
+    /// not the contended line the sleeper bitmap it replaces was.
+    asleep: AtomicUsize,
 }
 
 impl Pool {
@@ -328,7 +327,7 @@ impl Pool {
             running: AtomicBool::new(true),
             tuning,
             next_hint: AtomicUsize::new(0),
-            sleepers: AtomicUsize::new(0),
+            asleep: AtomicUsize::new(0),
         })
     }
 
@@ -409,63 +408,39 @@ impl Pool {
     /// Publish one job and make sure somebody will look.
     fn push(&self, worker: usize, job: Job) {
         self.injector.push(job);
-
-        // Waking conditionally used to be unsound, and the comment that said so
-        // was right at the time: a worker could drain its intake and park
-        // between one submit and the next, so a submitter that skipped the wake
-        // lost it. The sleeper bitmap changes that. A worker sets its bit
-        // *before* its last look at the injector, so a clear bit means it has
-        // not looked yet, and the job above is published before this reads the
-        // bitmap. Either way it is found.
+        // **Unconditionally, and without asking who is asleep.** There used to
+        // be a pool-wide bitmap of sleepers, consulted here so the unpark could
+        // be skipped when nobody was on the other end. That bitmap was one
+        // cache line taking a `SeqCst` read-modify-write from every worker that
+        // parked and every submit that looked, and it cost more than the wake
+        // it saved: parking sooner made the pool spend 818 ms of CPU against
+        // 445. `Host::unpark` on a running worker is now a single swap of that
+        // worker's own padded word, with no system call, so asking first buys
+        // nothing.
         //
-        // Read before writing. Every submit used to take this line
-        // exclusively with an RMW, and the line is shared by every worker
-        // parking and waking, so the wake bookkeeping serialised the whole
-        // pool: 110 ns a task at one worker became 1,380 ns at eight. When
-        // nobody is asleep - the throughput case - the bitmap is zero and a
-        // load answers the question.
-        //
-        // The load is `SeqCst` for the same reason the RMW was: it has to be
-        // ordered against publishing the job above, or a worker that sets its
-        // bit and then looks at the injector could be missed by a submitter
-        // that read the bitmap before the bit appeared.
-        let bit = 1usize << worker;
-        if self.sleepers.load(Ordering::SeqCst) == 0 {
-            return;
-        }
-        if self.sleepers.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
-            // It was asleep and this claimed it. It will take this job itself.
-            self.host.unpark(worker);
-        } else {
-            // It is running, so the job is behind whatever it is doing. Give
-            // the work a thief instead.
-            self.wake_one_sleeper(Some(worker));
-        }
+        // The race is closed by the park protocol rather than here: a worker
+        // that looks at the injector, finds it empty, and then parks finds the
+        // signal this leaves and does not sleep. See `StdHost::park`.
+        self.host.unpark(worker);
     }
 
-    /// Wake one parked worker other than `except`, if any is parked.
+    /// Tell some worker other than `except` that there may be work about.
     ///
-    /// The waker clears the bit rather than the sleeper, so a run of submits
-    /// wakes a run of *different* workers instead of hammering the same one.
-    /// Clearing it also means an unpark is never sent twice for one sleep, and
-    /// `Host::unpark` leaves a permit anyway, so a wake that arrives before the
-    /// park is not lost.
-    fn wake_one_sleeper(&self, except: Option<usize>) {
-        let spare = match except {
-            Some(id) => 1usize << id,
-            None => 0,
-        };
-        let mut parked = self.sleepers.load(Ordering::SeqCst) & !spare;
-        while parked != 0 {
-            let candidate = parked.trailing_zeros() as usize;
-            let bit = 1usize << candidate;
-            if self.sleepers.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
-                self.host.unpark(candidate);
-                return;
-            }
-            // Someone else claimed that one first. Try the next.
-            parked &= !bit;
+    /// Round-robin rather than "whoever is asleep", because knowing who is
+    /// asleep needs a shared bitmap and that bitmap was this pool's most
+    /// contended line. A signal to a worker that is already running is one swap
+    /// of its own padded word, so the worst a wrong guess costs is one wasted
+    /// pass around that worker's loop.
+    fn nudge(&self, except: Option<usize>) {
+        let workers = self.workers();
+        if workers < 2 {
+            return;
         }
+        let mut candidate = self.next_hint.fetch_add(1, Ordering::Relaxed) % workers;
+        if Some(candidate) == except {
+            candidate = (candidate + 1) % workers;
+        }
+        self.host.unpark(candidate);
     }
 
     /// Tell every worker to stop once it runs out of work, and wake them all.
@@ -580,28 +555,23 @@ impl Pool {
                 continue;
             }
 
-            // Nothing anywhere, so this worker is about to sleep. Announce that
-            // *before* the last look at the injector. A submit either publishes
-            // its job before that look, and the look finds it, or it publishes
-            // after, and then it reads a bitmap that already has this bit set
-            // and unparks. One of the two has to happen, which is what lets the
-            // park be long rather than a poll.
-            let bit = 1usize << w.id;
-            self.sleepers.fetch_or(bit, Ordering::SeqCst);
-
+            // Nothing anywhere, so this worker sleeps. One last look at the
+            // injector first, and then the park protocol closes the race: a
+            // submit landing after this look leaves a signal that `park`
+            // consumes instead of sleeping on.
             if !self.injector.is_empty() {
-                self.sleepers.fetch_and(!bit, Ordering::SeqCst);
                 continue;
             }
-            // Check for shutdown before parking, so a worker cannot sleep
-            // through the end.
+            // Checked before parking so a worker cannot sleep through the end;
+            // `shut_down` unparks every worker, so one that gets past this
+            // still leaves.
             if !self.is_running() {
-                self.sleepers.fetch_and(!bit, Ordering::SeqCst);
                 break;
             }
+            self.asleep.fetch_add(1, Ordering::Relaxed);
             self.host.park(w.id);
+            self.asleep.fetch_sub(1, Ordering::Relaxed);
             spins = 0;
-            self.sleepers.fetch_and(!bit, Ordering::SeqCst);
         }
 
         // Whatever this worker still holds privately would be invisible to
@@ -641,7 +611,7 @@ impl Pool {
             }
         }
         if taken > 1 {
-            self.wake_one_sleeper(None);
+            self.nudge(None);
         }
         taken
     }
@@ -659,7 +629,7 @@ impl Pool {
     /// argument and it is why the private queue is a deque rather than a stack.
     #[cold]
     fn promote(&self, mine: &mut VecDeque<Job>, queue: &Queue<Job>, id: usize) {
-        if self.sleepers.load(Ordering::Relaxed) == 0 {
+        if self.asleep.load(Ordering::Relaxed) == 0 {
             return;
         }
         let share = mine.len() / 2;
@@ -679,7 +649,7 @@ impl Pool {
             }
         }
         if shared > 0 {
-            self.wake_one_sleeper(Some(id));
+            self.nudge(Some(id));
         }
     }
 
@@ -722,7 +692,7 @@ impl Pool {
                 // A thief that took more than one has spare work of its own
                 // now, so the chain continues: one more sleeper joins in.
                 if got > 1 {
-                    self.wake_one_sleeper(Some(id));
+                    self.nudge(Some(id));
                 }
                 return got;
             }
@@ -738,7 +708,7 @@ impl core::fmt::Debug for Pool {
             .field("running", &self.is_running())
             .field(
                 "asleep",
-                &self.sleepers.load(Ordering::Relaxed).count_ones(),
+                &self.asleep.load(Ordering::Relaxed),
             )
             .finish_non_exhaustive()
     }

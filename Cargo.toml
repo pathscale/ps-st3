@@ -27,7 +27,13 @@ name = "st3"
 
 [dependencies]
 crossbeam-utils = { version = "0.8.14", default-features = false }
-# Only the `fanout` pool needs a lock, for the per-worker intake and for the
+# The `fanout` injector: one lock-free queue every worker drains, in place of
+# the per-worker intakes nothing but their owner could reach. Same MSRV as this
+# crate, and its only dependency is `crossbeam-utils`, which is already here.
+crossbeam-queue = { version = "0.3.12", default-features = false, features = [
+    "alloc",
+], optional = true }
+# Only the `fanout` pool needs a lock, for the
 # one-time handover of each deque to the thread that runs it.
 spin = { version = "0.9", default-features = false, features = [
     "spin_mutex",
@@ -39,7 +45,7 @@ default = ["fanout"]
 # The work-stealing pool built on these queues. On by default: it is the reason
 # this fork exists, and `spin` with default features off pulls in nothing else.
 # Turn it off with `default-features = false` for the deques alone.
-fanout = ["dep:spin"]
+fanout = ["dep:spin", "dep:crossbeam-queue"]
 
 # The OS substrate for `fanout`: threads, parking, a clock. The pool itself is
 # `no_std` and knows nothing about any of it, so a target without an OS links

@@ -37,8 +37,8 @@
 //! `host` feature, is what those look like with a `std` to implement them.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -706,10 +706,7 @@ impl core::fmt::Debug for Pool {
         f.debug_struct("Pool")
             .field("workers", &self.workers())
             .field("running", &self.is_running())
-            .field(
-                "asleep",
-                &self.asleep.load(Ordering::Relaxed),
-            )
+            .field("asleep", &self.asleep.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }

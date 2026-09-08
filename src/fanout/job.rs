@@ -54,8 +54,9 @@ impl Job {
             // SAFETY: the only way this function reaches a pointer is through
             // the `Job` built beside it below, whose pointer came from
             // `Box::into_raw` on a `Box<F>` for this same `F` and has not been
-            // run before, because running consumes the job.
-            let work = unsafe { Box::from_raw(pointer.as_ptr().cast::<F>()) };
+            // run before, because running consumes the job. The body of an
+            // `unsafe fn` is already an unsafe block on this edition.
+            let work = Box::from_raw(pointer.as_ptr().cast::<F>());
             work();
         }
 
@@ -87,8 +88,10 @@ impl Job {
     ///   the worker's deque with it.
     /// * This job is the only one naming `pointer`, since running consumes the
     ///   pointer's ownership.
+    // Not `const`: a function pointer in a `const fn` is 1.61, and this crate
+    // holds a 1.60 floor.
     #[must_use]
-    pub const unsafe fn from_raw(pointer: NonNull<()>, execute: unsafe fn(NonNull<()>)) -> Self {
+    pub unsafe fn from_raw(pointer: NonNull<()>, execute: unsafe fn(NonNull<()>)) -> Self {
         Self { pointer, execute }
     }
 

@@ -203,5 +203,5 @@ fn main() {
         n.as_secs_f64() * 1e3,
         s.as_secs_f64() / n.as_secs_f64()
     );
-    println!("\n  park timeouts during the run: {}", host.timeouts());
+    println!("\n  spurious wakes during the run: {}", host.spurious());
 }

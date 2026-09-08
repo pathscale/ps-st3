@@ -114,6 +114,11 @@ fn work_reaches_workers_it_was_not_given_to() {
 /// CPU against 3.7 ms, and 25,705 park timeouts against 304. The bound below is
 /// deliberately loose, a tenth of the old cost, so it fails on a regression to
 /// polling rather than on a busy machine.
+///
+/// It counts **spurious wakes** now rather than timeouts, because parking no
+/// longer has a timeout to expire. That is a stronger test, not a weaker one: a
+/// regression to polling would have to show up as the platform returning from a
+/// wait with nothing to show for it, and the same bound catches it.
 #[test]
 fn an_idle_pool_stays_idle() {
     let workers = 8;
@@ -129,10 +134,10 @@ fn an_idle_pool_stays_idle() {
 
     // Let every worker find nothing and park.
     std::thread::sleep(Duration::from_millis(50));
-    let before = host.timeouts();
+    let before = host.spurious();
     let started = Instant::now();
     std::thread::sleep(Duration::from_secs(1));
-    let woke = host.timeouts() - before;
+    let woke = host.spurious() - before;
     let seconds = started.elapsed().as_secs_f64();
 
     pool.shut_down();

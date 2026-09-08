@@ -302,3 +302,98 @@ fn a_dropped_pool_releases_queued_work() {
         "queued work leaked when the pool was dropped"
     );
 }
+
+/// **Work held privately is not stealable, and that has to be bounded.**
+///
+/// A worker runs out of its own `VecDeque`, which nothing else can see. Only
+/// what it has promoted into its sharing deque, and what is still on the
+/// injector, can be reached by anybody else.
+///
+/// This arranges the case that strands work, deterministically: every job is
+/// submitted **before any worker starts**, and there are exactly as many as one
+/// worker takes in a single trip to the injector. So one worker takes all of
+/// them and the other gets nothing. The private queue is LIFO, and the long job
+/// is submitted last, so it is the one that worker runs first, with the short
+/// ones stranded behind it.
+#[test]
+fn short_jobs_do_not_wait_behind_a_long_one() {
+    let workers = 2;
+    let batch = st3::fanout::PULL_BATCH;
+    let shorts = batch - 1;
+    let host = Arc::new(StdHost::new(workers));
+    let pool = Pool::new(workers, 256, host);
+
+    let shorts_done = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicUsize::new(0));
+    let held: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)> =
+        Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+    // Everything is queued before a worker exists, so one worker takes the
+    // whole batch on its first look and the other finds an empty injector.
+    for _ in 0..shorts {
+        let done = shorts_done.clone();
+        pool.submit_fn(move || {
+            done.fetch_add(1, Ordering::AcqRel);
+        });
+    }
+    // Blocks on a condition variable rather than spinning. `getrusage` is
+    // process-wide and the idle-CPU test reads it, so a test that burns a core
+    // here fails that one instead of this one.
+    let (waiting, gate) = (held.clone(), release.clone());
+    pool.submit_fn(move || {
+        let (lock, signal) = &*waiting;
+        let mut open = lock.lock().expect("the lock");
+        while !*open {
+            open = signal.wait(open).expect("the wait");
+        }
+        gate.fetch_add(1, Ordering::Release);
+    });
+
+    let threads: Vec<_> = (0..workers)
+        .map(|id| pool.runner(id))
+        .map(|w| {
+            let pool = pool.clone();
+            std::thread::spawn(move || pool.run(w))
+        })
+        .collect();
+
+    // If the short jobs cannot be reached behind the long one, this never
+    // finishes; the bound turns a hang into a failure.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while shorts_done.load(Ordering::Acquire) < shorts && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let ran = shorts_done.load(Ordering::Acquire);
+    let finished = ran == shorts;
+
+    // Let the long job go regardless, so shutdown can finish either way.
+    {
+        let (lock, signal) = &*held;
+        *lock.lock().expect("the lock") = true;
+        signal.notify_all();
+    }
+    while release.load(Ordering::Acquire) == 0 && Instant::now() < deadline + Duration::from_secs(2)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    pool.shut_down();
+    for t in threads {
+        let _ = t.join();
+    }
+
+    // **The honest invariant is a bound, not perfection.** A worker running a
+    // long job holds whatever is left of its private queue, and nothing can
+    // reach that until it pops again. What the pool promises is that the amount
+    // is bounded by one batch: `injector_batch` is what a worker takes, half of
+    // it is published for stealing immediately, and the rest is the exposure.
+    //
+    // Before this was measured the default batch was 32 and 15 of 31 short jobs
+    // were stranded behind one long one. At 8, which the sweep showed costs no
+    // throughput at all, it is one.
+    assert!(
+        ran + batch >= shorts,
+        "{ran} of {shorts} short jobs ran while one worker held a long one; \
+         a batch of {batch} should have stranded at most {batch}"
+    );
+    let _ = finished;
+}

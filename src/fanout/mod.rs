@@ -5,8 +5,9 @@
 //!
 //! One [`lifo::Worker`](crate::lifo::Worker) per pool worker, taken by value by
 //! the thread that runs it, so pushing and popping local work touch nothing
-//! shared. Work arrives from outside through a per-worker intake, and an idle
-//! worker steals from a random victim before it parks.
+//! shared. Work arrives from outside through one lock-free injector every
+//! worker drains, and an idle worker steals from a random victim before it
+//! parks.
 //!
 //! Tasks are independent by construction: no join, no continuation, no
 //! completion signal. A task may run whenever a worker gets to it, and a caller
@@ -37,10 +38,12 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::config::AtomicUnsignedLong;
+use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 
 use crate::lifo::{Stealer, Worker as Queue};
@@ -48,8 +51,10 @@ use spin::Mutex;
 
 #[cfg(feature = "host")]
 mod host;
+mod job;
 #[cfg(feature = "host")]
 pub use host::StdHost;
+pub use job::Job;
 
 /// The most tasks one steal moves, before halving.
 ///
@@ -72,6 +77,14 @@ pub struct Tuning {
     pub rounds_before_park: u32,
     /// How long to wait between two empty rounds, in spin-loop hints.
     pub backoff_spins: u32,
+    /// How many jobs a worker runs between two looks at whether anyone needs
+    /// work shared with them.
+    ///
+    /// This is the heartbeat. Small means work becomes stealable promptly and
+    /// every worker pays the check often; large means a worker can hoard a
+    /// backlog while its neighbours sleep. It is a count rather than a clock
+    /// because the pool has no clock it is willing to read on the hot path.
+    pub promote_every: u64,
 }
 
 impl Default for Tuning {
@@ -79,6 +92,7 @@ impl Default for Tuning {
         Self {
             rounds_before_park: ROUNDS_BEFORE_PARK,
             backoff_spins: BACKOFF_SPINS,
+            promote_every: PROMOTE_EVERY,
         }
     }
 }
@@ -100,10 +114,19 @@ const ROUNDS_BEFORE_PARK: u32 = 64;
 /// How long to wait between two empty rounds.
 const BACKOFF_SPINS: u32 = 64;
 
-/// A unit of work.
+/// Jobs run between two heartbeats.
+const PROMOTE_EVERY: u64 = 64;
+
+/// A unit of work, as a boxed closure.
 ///
 /// Independent by construction: no join, no continuation, no completion
 /// signal, so a task may run whenever a worker reaches it.
+///
+/// **This is the convenience shape, not the cheap one.** The queues hold
+/// [`Job`], which is a thin pointer and a function; handing the pool a
+/// `Box<dyn FnOnce()>` means boxing that fat pointer again. Callers that care
+/// use [`Pool::submit_fn`], which allocates once, or [`Pool::submit_job`],
+/// which allocates nothing.
 pub type Task = Box<dyn FnOnce() + Send>;
 
 /// What the pool needs from an operating system, which is almost nothing: a way
@@ -117,7 +140,7 @@ pub type Task = Box<dyn FnOnce() + Send>;
 /// next `park` return immediately rather than sleep. The pool publishes work
 /// and *then* unparks, so an implementation that drops a wakeup for a worker
 /// which has not parked yet loses the only notice that work exists, and that
-/// worker sleeps with a task sitting in its intake.
+/// worker sleeps with a job sitting in the injector.
 ///
 /// A spin satisfies this trivially, since it never sleeps. A condition variable
 /// does not: it needs a flag beside it, which is what `StdHost` carries.
@@ -162,10 +185,7 @@ impl Runner {
 /// value once, and from then on the owning thread's pushes and pops touch
 /// nothing shared.
 struct Local {
-    queue: Mutex<Option<Queue<Task>>>,
-    /// Where work from outside lands, since a `Queue` cannot be pushed to by
-    /// anyone but its owner.
-    intake: Mutex<Vec<Task>>,
+    queue: Mutex<Option<Queue<Job>>>,
     completed: AtomicUnsignedLong,
 }
 
@@ -174,17 +194,30 @@ struct Local {
 // collision, and a collision only matters between two live pools.
 static NEXT_POOL: AtomicUsize = AtomicUsize::new(0);
 
-/// A fixed set of workers, their deques, and the intakes work arrives through.
+/// A fixed set of workers, their deques, and the injector work arrives through.
 ///
 /// Construct it with [`Pool::new`], hand each [`Runner`] to a thread of your
 /// own with [`Pool::run`], and feed it with [`Pool::submit`].
 pub struct Pool {
     id: usize,
     local: Vec<CachePadded<Local>>,
-    stealers: Vec<Stealer<Task>>,
+    stealers: Vec<Stealer<Job>>,
+    /// Where work submitted from outside lands.
+    ///
+    /// **One queue, not one per worker.** It used to be a `Mutex<Vec<Task>>`
+    /// per worker, which nothing but that worker could reach. That is the
+    /// single decision this pool got wrong: an idle worker could not find work
+    /// sitting in a neighbour's intake, so the rule every work-stealing
+    /// scheduler relies on, that a searching worker will eventually find any
+    /// work there is, did not hold. Six different scheduling policies were
+    /// tried on top of it and all six lost. A lock-free queue every worker
+    /// drains makes the rule true.
+    injector: SegQueue<Job>,
     host: Arc<dyn Host>,
     running: AtomicBool,
     tuning: Tuning,
+    /// Round-robin cursor for choosing which sleeper a hintless submit wakes.
+    next_hint: AtomicUsize,
     /// One bit per worker, set while that worker is parked or about to park.
     ///
     /// This exists because nothing else can tell a sleeping worker that work
@@ -202,16 +235,16 @@ impl Pool {
     /// # Capacity is not backpressure
     ///
     /// The deques are bounded, which is st3's shape, but [`submit`] does not
-    /// push into one. It appends to an unbounded intake that the owning worker
+    /// push into one. It appends to an unbounded injector that every worker
     /// drains, so **`capacity` bounds what a worker holds, not what a caller
     /// may hand it.** A submitter is never blocked and never refused; if tasks
-    /// arrive faster than they run, the intake grows until memory runs out.
+    /// arrive faster than they run, the injector grows until memory runs out.
     ///
-    /// When the worker drains an intake larger than its deque, the overflow is
-    /// run inline *on that worker*, which neither drops a task nor grows the
-    /// deque. That is the only sense in which capacity is enforced, and it
-    /// costs the worker its place in the queue rather than costing the
-    /// submitter anything.
+    /// A worker takes only `injector.len() / workers + 1` at a time, capped at
+    /// half its deque, so what it takes cannot immediately overflow. If it
+    /// overflows anyway, because a thief filled the deque meanwhile, the excess
+    /// runs inline on that worker, which neither drops a job nor grows the
+    /// deque.
     ///
     /// A caller that needs backpressure has to impose it: count outstanding
     /// tasks and stop submitting. This pool will not do it for you.
@@ -250,7 +283,6 @@ impl Pool {
             stealers.push(queue.stealer());
             local.push(CachePadded::new(Local {
                 queue: Mutex::new(Some(queue)),
-                intake: Mutex::new(Vec::new()),
                 completed: AtomicUnsignedLong::new(0),
             }));
         }
@@ -259,8 +291,10 @@ impl Pool {
             local,
             stealers,
             host,
+            injector: SegQueue::new(),
             running: AtomicBool::new(true),
             tuning,
+            next_hint: AtomicUsize::new(0),
             sleepers: AtomicUsize::new(0),
         })
     }
@@ -299,28 +333,58 @@ impl Pool {
         u64::from(self.local[id].completed.load(Ordering::Relaxed))
     }
 
-    /// Hand a task to a worker.
+    /// Hand a boxed closure to the pool.
     ///
-    /// **Always unparks.** The obvious optimisation is to wake only when the
-    /// intake was empty, on the reasoning that a non-empty intake means the
-    /// worker is already awake. It is not sound: the worker can drain the
-    /// intake and park between one submit and the next, and then nothing wakes
-    /// it. That is what stalled the design this replaced, and an unpark on an
-    /// already-running worker is cheap.
+    /// `worker` is a **hint**, and only for waking: work goes to the shared
+    /// injector that every worker drains, so any worker may run it. The hint
+    /// says which one to try to wake first, which is worth something when a
+    /// caller knows where the work belongs and worth nothing otherwise.
+    ///
+    /// This costs two allocations, because a `Box<dyn FnOnce()>` is a fat
+    /// pointer and a [`Job`] holds a thin one. [`Pool::submit_fn`] costs one
+    /// and is otherwise identical.
     pub fn submit(&self, worker: usize, task: Task) {
-        self.local[worker].intake.lock().push(task);
+        self.push(worker, Job::from_boxed(task));
+    }
+
+    /// Hand a closure to the pool, allocating once.
+    ///
+    /// The closure is boxed and the function that runs it is monomorphised, so
+    /// there is no trait object and no second indirection.
+    pub fn submit_fn<F>(&self, work: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.push(self.hint(), Job::from_boxed(work));
+    }
+
+    /// Hand the pool work it does not have to allocate for.
+    ///
+    /// For a caller whose work is already on the heap: a task inside an `Arc`,
+    /// a slot in an arena, a future something else has already boxed. See
+    /// [`Job::from_raw`] for what the caller has to guarantee.
+    pub fn submit_job(&self, job: Job) {
+        self.push(self.hint(), job);
+    }
+
+    /// Round-robin, for submitters that expressed no preference. It only
+    /// chooses who to *wake*, so a poor choice costs a wakeup and not a task.
+    fn hint(&self) -> usize {
+        self.next_hint.fetch_add(1, Ordering::Relaxed) % self.workers()
+    }
+
+    /// Publish one job and make sure somebody will look.
+    fn push(&self, worker: usize, job: Job) {
+        self.injector.push(job);
 
         // Waking conditionally used to be unsound, and the comment that said so
         // was right at the time: a worker could drain its intake and park
         // between one submit and the next, so a submitter that skipped the wake
         // lost it. The sleeper bitmap changes that. A worker sets its bit
-        // *before* its last look at the intake, so a clear bit means it has not
-        // looked yet, and the task above is published before this reads the
+        // *before* its last look at the injector, so a clear bit means it has
+        // not looked yet, and the job above is published before this reads the
         // bitmap. Either way it is found.
         //
-        // What that buys is the whole parking path on the common case: for a
-        // `StdHost`, one mutex acquisition and one condvar notify per task,
-        // gone whenever the target is already running.
         // Read before writing. Every submit used to take this line
         // exclusively with an RMW, and the line is shared by every worker
         // parking and waking, so the wake bookkeeping serialised the whole
@@ -329,20 +393,20 @@ impl Pool {
         // load answers the question.
         //
         // The load is `SeqCst` for the same reason the RMW was: it has to be
-        // ordered against publishing the task above, or a worker that sets its
-        // bit and then looks at the intake could be missed by a submitter that
-        // read the bitmap before the bit appeared.
+        // ordered against publishing the job above, or a worker that sets its
+        // bit and then looks at the injector could be missed by a submitter
+        // that read the bitmap before the bit appeared.
         let bit = 1usize << worker;
         if self.sleepers.load(Ordering::SeqCst) == 0 {
             return;
         }
         if self.sleepers.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
-            // It was asleep and this claimed it. It will take this task itself.
+            // It was asleep and this claimed it. It will take this job itself.
             self.host.unpark(worker);
         } else {
-            // It is running, so the task is behind whatever it is doing. Give
+            // It is running, so the job is behind whatever it is doing. Give
             // the work a thief instead.
-            self.wake_one_sleeper(worker);
+            self.wake_one_sleeper(Some(worker));
         }
     }
 
@@ -353,8 +417,12 @@ impl Pool {
     /// Clearing it also means an unpark is never sent twice for one sleep, and
     /// `Host::unpark` leaves a permit anyway, so a wake that arrives before the
     /// park is not lost.
-    fn wake_one_sleeper(&self, except: usize) {
-        let mut parked = self.sleepers.load(Ordering::SeqCst) & !(1usize << except);
+    fn wake_one_sleeper(&self, except: Option<usize>) {
+        let spare = match except {
+            Some(id) => 1usize << id,
+            None => 0,
+        };
+        let mut parked = self.sleepers.load(Ordering::SeqCst) & !spare;
         while parked != 0 {
             let candidate = parked.trailing_zeros() as usize;
             let bit = 1usize << candidate;
@@ -370,7 +438,7 @@ impl Pool {
     /// Tell every worker to stop once it runs out of work, and wake them all.
     ///
     /// **Tasks submitted from here on may never run.** A worker leaves as soon
-    /// as it finds its deque empty, its intake empty and nothing to steal, so
+    /// as it finds its deque empty, the injector empty and nothing to steal, so
     /// anything that lands afterwards is dropped when the pool is. This pool
     /// has no completion signal by design; if you need every task to have run,
     /// stop submitting and wait for your own count before calling this.
@@ -414,37 +482,65 @@ impl Pool {
             None => return false,
         };
 
-        let mut scratch: Vec<Task> = Vec::new();
+        // **The worker's own work, in a queue nothing else can see.**
+        //
+        // This is the change that matters most in this whole pool. `queue` is
+        // the *sharing* deque, and every pop from it is a compare-exchange
+        // against any thief that might be looking. `mine` is a plain
+        // `VecDeque` on this thread's stack, so running work out of it costs no
+        // atomic at all. Work is promoted from here into `queue` on a heartbeat
+        // and only when somebody is asleep to receive it, which is the design
+        // `forte`, `chili` and Spice all arrived at: pay for sharing on a
+        // timer, not on every task.
+        let mut mine: VecDeque<Job> = VecDeque::new();
+        let mut tick = 0u64;
         let mut spins = 0u32;
         let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (w.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
         loop {
-            if let Some(task) = queue.pop() {
+            // 1. This worker's own queue. No synchronisation whatsoever.
+            if let Some(job) = mine.pop_back() {
                 spins = 0;
-                task();
+                tick = tick.wrapping_add(1);
+                if tick % self.tuning.promote_every == 0 {
+                    self.promote(&mut mine, &queue, w.id);
+                }
+                job.run();
                 self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
-            if self.drain_intake(w.id, &queue, &mut scratch) > 0 {
+            // 2. What this worker shared and nobody took.
+            if let Some(job) = queue.pop() {
                 spins = 0;
+                job.run();
+                self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
+            // 3. Somebody else's.
             if self.steal_once(&queue, w.id, &mut rng) > 0 {
                 spins = 0;
                 continue;
             }
 
+            // 4. What arrived from outside. Last, because it is the queue every
+            //    worker contends on.
+            if self.take_from_injector(&mut mine) > 0 {
+                spins = 0;
+                continue;
+            }
+
             // Nothing found this round. Look again before announcing anything:
-            // see `Tuning::rounds_before_park` for why the wake, not the park, costs.
+            // see `Tuning::rounds_before_park` for why the wake, not the park,
+            // costs.
             if spins < self.tuning.rounds_before_park {
                 spins += 1;
                 // Back off *without* touching anything shared. Looking again
-                // means locking this worker's intake and probing every other
-                // worker's queue, so an empty round is not free to anyone
-                // else: repeating it immediately is what starves the producer
-                // this is trying to keep fed.
+                // means a pop off the injector and a probe of every other
+                // worker's queue, so an empty round is not free to anyone else:
+                // repeating it immediately is what starves the producer this is
+                // trying to keep fed.
                 for _ in 0..self.tuning.backoff_spins {
                     core::hint::spin_loop();
                 }
@@ -452,15 +548,15 @@ impl Pool {
             }
 
             // Nothing anywhere, so this worker is about to sleep. Announce that
-            // *before* the last look at the intake. A submit either publishes
-            // its task before that look, and the look finds it, or it publishes
+            // *before* the last look at the injector. A submit either publishes
+            // its job before that look, and the look finds it, or it publishes
             // after, and then it reads a bitmap that already has this bit set
             // and unparks. One of the two has to happen, which is what lets the
             // park be long rather than a poll.
             let bit = 1usize << w.id;
             self.sleepers.fetch_or(bit, Ordering::SeqCst);
 
-            if !self.local[w.id].intake.lock().is_empty() {
+            if !self.injector.is_empty() {
                 self.sleepers.fetch_and(!bit, Ordering::SeqCst);
                 continue;
             }
@@ -475,35 +571,83 @@ impl Pool {
             self.sleepers.fetch_and(!bit, Ordering::SeqCst);
         }
 
+        // Whatever this worker still holds privately would be invisible to
+        // everyone else, so it goes back where another worker can reach it.
+        // Shutdown makes no promise that it runs, but losing it silently is a
+        // different thing from not running it.
+        for job in mine {
+            self.injector.push(job);
+        }
+
         // Put it back, so a caller that restarts this worker finds its deque.
         *self.local[w.id].queue.lock() = Some(queue);
         true
     }
 
-    /// Move what arrived from outside into the local deque.
-    /// `scratch` is the worker's own buffer, swapped in so the intake keeps a
-    /// capacity rather than being left at zero for the next submit to
-    /// reallocate while holding the lock.
-    fn drain_intake(&self, id: usize, queue: &Queue<Task>, scratch: &mut Vec<Task>) -> usize {
-        debug_assert!(scratch.is_empty());
-        core::mem::swap(&mut *self.local[id].intake.lock(), scratch);
-        let n = scratch.len();
-        // Wake before the loop, not after it. The overflow below runs inline on
-        // this worker, and an intake larger than the deque can therefore hold
-        // this thread for thousands of tasks; telling a sleeper afterwards is
-        // telling it once the work is gone.
-        if n > 1 {
-            self.wake_one_sleeper(id);
-        }
-        for task in scratch.drain(..) {
-            if let Err(back) = queue.push(task) {
-                // The deque is full. Running it here is the only option that
-                // neither drops the task nor grows without bound.
-                back();
-                self.local[id].completed.fetch_add(1, Ordering::Relaxed);
+    /// Move a run of what arrived from outside into this worker's own queue.
+    ///
+    /// **Pop, do not ask.** `SegQueue::len` reads both ends, so a worker that
+    /// calls it every empty round turns the length counter into the contended
+    /// line the per-worker intakes used to be. A failed pop answers the same
+    /// question and touches one end.
+    ///
+    /// A run rather than one, because the trip to a queue every worker shares
+    /// is the expensive part and what lands here costs nothing to run. A run
+    /// rather than all of it, because this queue is private: a worker that
+    /// swallowed the injector would make the whole backlog unstealable until
+    /// its next heartbeat.
+    fn take_from_injector(&self, mine: &mut VecDeque<Job>) -> usize {
+        let mut taken = 0;
+        while taken < PULL_BATCH {
+            match self.injector.pop() {
+                Some(job) => {
+                    mine.push_back(job);
+                    taken += 1;
+                }
+                None => break,
             }
         }
-        n
+        if taken > 1 {
+            self.wake_one_sleeper(None);
+        }
+        taken
+    }
+
+    /// Publish some of this worker's private queue where thieves can reach it.
+    ///
+    /// **Only when somebody is asleep.** With every worker busy there is nobody
+    /// to take it, and moving a job into the sharing deque costs a
+    /// compare-exchange that buys nothing. The bitmap load is `Relaxed`: a
+    /// missed sleeper waits for the next heartbeat, which is a few thousand
+    /// jobs away, not for ever.
+    ///
+    /// The **oldest** jobs go, because in a depth-first workload the oldest is
+    /// the largest subtree, so one steal moves the most work. That is Cilk's
+    /// argument and it is why the private queue is a deque rather than a stack.
+    #[cold]
+    fn promote(&self, mine: &mut VecDeque<Job>, queue: &Queue<Job>, id: usize) {
+        if self.sleepers.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let share = mine.len() / 2;
+        let mut shared = 0;
+        for _ in 0..share {
+            match mine.pop_front() {
+                Some(job) => match queue.push(job) {
+                    Ok(()) => shared += 1,
+                    Err(back) => {
+                        // The sharing deque is full, which means the pool is
+                        // busy and nobody needs help after all.
+                        mine.push_front(back);
+                        break;
+                    }
+                },
+                None => break,
+            }
+        }
+        if shared > 0 {
+            self.wake_one_sleeper(Some(id));
+        }
     }
 
     /// One round of stealing from random victims.
@@ -512,7 +656,7 @@ impl Pool {
     /// victims probability zero, which is what Blumofe and Leiserson's bound
     /// forbids and what creates hot spots in practice. Measured on the design
     /// this replaces: a fixed neighbour cost 75% against random.
-    fn steal_once(&self, queue: &Queue<Task>, id: usize, rng: &mut u64) -> usize {
+    fn steal_once(&self, queue: &Queue<Job>, id: usize, rng: &mut u64) -> usize {
         let workers = self.workers();
         if workers < 2 {
             return 0;
@@ -545,7 +689,7 @@ impl Pool {
                 // A thief that took more than one has spare work of its own
                 // now, so the chain continues: one more sleeper joins in.
                 if got > 1 {
-                    self.wake_one_sleeper(id);
+                    self.wake_one_sleeper(Some(id));
                 }
                 return got;
             }

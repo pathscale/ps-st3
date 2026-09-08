@@ -101,7 +101,7 @@ impl Default for Tuning {
             rounds_before_park: ROUNDS_BEFORE_PARK,
             backoff_spins: BACKOFF_SPINS,
             promote_every: PROMOTE_EVERY,
-            injector_batch: PULL_BATCH,
+            injector_batch: INJECTOR_BATCH,
         }
     }
 }
@@ -149,6 +149,19 @@ const BACKOFF_SPINS: u32 = 1024;
 
 /// Jobs run between two heartbeats.
 const PROMOTE_EVERY: u64 = 64;
+
+/// Jobs a worker takes off the injector in one trip.
+///
+/// **This is the bound on stranding.** What a worker takes goes into its
+/// private queue; half of that is published for stealing at once, and the rest
+/// is unreachable until the worker pops again. A worker that takes a batch and
+/// then starts one long job strands the private half for the whole of it.
+///
+/// Swept at 8, 32 and 128 over 100,000 tasks: 49.2, 48.3 and 50.3 ms, so the
+/// size buys no throughput. Given that, it should be as small as the injector
+/// traffic tolerates, because it is paid for in latency for anybody stuck
+/// behind a long job.
+const INJECTOR_BATCH: usize = 8;
 
 /// A unit of work, as a boxed closure.
 ///
@@ -567,7 +580,18 @@ impl Pool {
                 // every heartbeat landed on the last job of the second batch,
                 // when the private queue was empty. The mechanism fired
                 // forever and shared nothing.
-                self.promote(&mut mine, &queue, w.id);
+                // **Unconditionally, not only when somebody is asleep.** A
+                // worker that takes a batch and then starts a long job holds
+                // the rest privately, where nothing can reach it, and it will
+                // not promote again because promoting happens between jobs. If
+                // the check for a sleeper runs before anybody has parked, the
+                // batch is stranded for the whole of that long job. Measured:
+                // 0 of 31 short jobs ran behind one long one.
+                //
+                // So the refill always publishes half. That half costs a
+                // compare-exchange to take back if nobody steals it, which is
+                // the price of it being reachable at all.
+                self.share(&mut mine, &queue, w.id);
                 until_promote = self.tuning.promote_every;
                 continue;
             }
@@ -679,12 +703,24 @@ impl Pool {
     /// The **oldest** jobs go, because in a depth-first workload the oldest is
     /// the largest subtree, so one steal moves the most work. That is Cilk's
     /// argument and it is why the private queue is a deque rather than a stack.
+    /// The heartbeat: share only if somebody is waiting for it.
+    ///
+    /// Between jobs, with everyone busy, moving work into the sharing deque
+    /// costs a compare-exchange and buys nothing. The refill path calls
+    /// [`share`](Pool::share) instead, which does not ask.
     #[cold]
     fn promote(&self, mine: &mut VecDeque<Job>, queue: &Queue<Job>, id: usize) {
-        // Nothing to share, or nobody to share it with. The second is a
-        // `Relaxed` load: a sleeper missed here waits for the next refill or
-        // the next countdown, and both are close.
-        if mine.len() < 2 || self.sleeping.load(Ordering::Relaxed) == 0 {
+        // The load is `Relaxed`: a sleeper missed here waits for the next
+        // refill or the next countdown, and both are close.
+        if self.sleeping.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        self.share(mine, queue, id);
+    }
+
+    /// Move half of this worker's private queue where thieves can reach it.
+    fn share(&self, mine: &mut VecDeque<Job>, queue: &Queue<Job>, id: usize) {
+        if mine.len() < 2 {
             return;
         }
         let share = mine.len() / 2;

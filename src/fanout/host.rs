@@ -7,57 +7,76 @@
 //! there is a `std` to implement them with, and it is the reference a target
 //! without one replaces.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use crossbeam_utils::CachePadded;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 use std::vec::Vec;
 
 use super::Host;
 
-/// Condvar parking, one pair per worker.
+/// Futex parking, one word per worker.
+///
+/// **No mutex and no condition variable.** The pool wakes a worker on the hot
+/// path, and a condvar wake is a mutex acquisition, a signal and a release even
+/// when nobody is on the other end. This is one atomic word per worker, and a
+/// wake with nobody asleep is a store and a load with no system call at all.
 #[derive(Debug)]
 pub struct StdHost {
-    slots: Vec<Slot>,
+    slots: Vec<CachePadded<Slot>>,
     origin: Instant,
-    /// How many times a park timed out rather than being woken. With the pool
-    /// waking its own sleepers this should stay near zero under load; what it
-    /// still counts on an idle pool is one tick per worker per 100 ms.
-    timeouts: AtomicU64,
+    /// How many times a park woke with no permit to show for it.
+    spurious: AtomicU64,
 }
+
+/// One worker's park word.
+///
+/// `PARKED` means a thread is, or is about to be, blocked on this address.
+/// `PERMIT` means a wake arrived and the next park must consume it rather than
+/// sleep, which is the invariant [`Host`] requires.
+#[derive(Debug, Default)]
+struct Slot {
+    word: AtomicU32,
+}
+
+const RUNNING: u32 = 0;
+const PARKED: u32 = 1;
+const PERMIT: u32 = 2;
 
 impl StdHost {
     #[must_use]
     /// One park slot per worker, and a clock whose origin is now.
     pub fn new(workers: usize) -> Self {
         let mut slots = Vec::new();
-        slots.resize_with(workers, Slot::default);
+        slots.resize_with(workers, || CachePadded::new(Slot::default()));
         Self {
             slots,
             origin: Instant::now(),
-            timeouts: AtomicU64::new(0),
+            spurious: AtomicU64::new(0),
         }
     }
 
-    /// Parks that timed out instead of being woken.
+    /// How many parks woke with no permit to show for it.
+    ///
+    /// The platform is allowed to return from a wait for its own reasons; the
+    /// pool loops, so one costs a pass and nothing else. A number climbing
+    /// under load means something is waking workers that has no work for them.
     #[must_use]
-    pub fn timeouts(&self) -> u64 {
-        self.timeouts.load(Ordering::Relaxed)
+    pub fn spurious(&self) -> u64 {
+        self.spurious.load(Ordering::Relaxed)
     }
-}
 
-/// One worker's park state.
-///
-/// The permit and the waiter count are atomics so the common cases cost no
-/// lock at all: an unpark with nobody waiting is one store and one load, and a
-/// park with a permit already left is one swap. The mutex and condvar are only
-/// entered when a thread genuinely has to sleep, which is what a mutex per
-/// wake was costing before.
-#[derive(Debug, Default)]
-struct Slot {
-    permit: AtomicBool,
-    waiting: AtomicUsize,
-    mutex: Mutex<()>,
-    condvar: Condvar,
+    /// How many parks ended in a timeout rather than a wake.
+    ///
+    /// Always zero: parking has no timeout any more. It had one as a backstop
+    /// against a wake going missing, from a time when the pool did not wake its
+    /// own sleepers and the timeout *was* the discovery mechanism. The pool
+    /// wakes them now and `shut_down` unparks every worker, so the backstop
+    /// guarded nothing and cost a wakeup per worker per 100 ms on an idle pool.
+    #[must_use]
+    #[deprecated(since = "0.6.0", note = "parking no longer times out; see `spurious`")]
+    pub fn timeouts(&self) -> u64 {
+        0
+    }
 }
 
 impl Host for StdHost {
@@ -72,42 +91,48 @@ impl Host for StdHost {
     /// milliseconds is short enough that such a bug costs latency rather than a
     /// hang, and long enough that idling is free.
     fn park(&self, worker: usize) {
-        let slot = &self.slots[worker];
-        // A permit left by an unpark that arrived first. No lock, no sleep.
-        if slot.permit.swap(false, Ordering::AcqRel) {
+        let word = &self.slots[worker].word;
+        // Claim a permit left by a wake that arrived first, and do not sleep.
+        if word.swap(RUNNING, Ordering::AcqRel) == PERMIT {
+            return;
+        }
+        // Announce, then look once more. A wake landing between the two sees
+        // `PARKED` and calls `wake_one`, which is not lost: this thread is
+        // either already waiting, or about to wait on a word that no longer
+        // reads `PARKED` and so returns at once.
+        if word
+            .compare_exchange(RUNNING, PARKED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            word.store(RUNNING, Ordering::Release);
             return;
         }
 
-        let guard = slot.mutex.lock().expect("the park mutex is not poisoned");
-        // Announce before the last look, so an unpark either sees the count
-        // and notifies, or leaves a permit this finds below.
-        slot.waiting.fetch_add(1, Ordering::SeqCst);
-        if slot.permit.swap(false, Ordering::AcqRel) {
-            slot.waiting.fetch_sub(1, Ordering::SeqCst);
-            return;
+        // **No timeout.** There used to be one, at 100 ms, as a backstop
+        // against a wake going missing. It is not needed: `Pool` sets a
+        // worker's sleeper bit before its last look for work, so a submit
+        // either publishes before that look or reads a bitmap with the bit
+        // already set and unparks; and `shut_down` unparks every worker. What
+        // the timeout did cost was a wakeup per worker per 100 ms forever on a
+        // pool with nothing to do.
+        while word.load(Ordering::Acquire) == PARKED {
+            atomic_wait::wait(word, PARKED);
+            if word.load(Ordering::Acquire) == PARKED {
+                self.spurious.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        let (_guard, timed_out) = slot
-            .condvar
-            .wait_timeout(guard, Duration::from_millis(100))
-            .expect("the park mutex is not poisoned");
-        slot.waiting.fetch_sub(1, Ordering::SeqCst);
-        if timed_out.timed_out() {
-            self.timeouts.fetch_add(1, Ordering::Relaxed);
-        }
-        slot.permit.store(false, Ordering::Release);
+        word.store(RUNNING, Ordering::Release);
     }
 
     fn unpark(&self, worker: usize) {
-        let slot = &self.slots[worker];
-        slot.permit.store(true, Ordering::Release);
-        // Nobody is on the condvar, so there is nothing to notify and no
-        // reason to take the lock. This is the case that used to cost a mutex
-        // acquisition on every submit that found a sleeper bit set.
-        if slot.waiting.load(Ordering::SeqCst) == 0 {
-            return;
+        let word = &self.slots[worker].word;
+        // Leave a permit whatever the state was, because `Host` requires an
+        // unpark that arrives before the park to make that park return at once.
+        if word.swap(PERMIT, Ordering::AcqRel) == PARKED {
+            // Somebody is on the address, so this costs a system call. Nothing
+            // was asleep in the other cases and this is a single swap.
+            atomic_wait::wake_one(word);
         }
-        let _guard = slot.mutex.lock().expect("the park mutex is not poisoned");
-        slot.condvar.notify_one();
     }
 
     fn now_ns(&self) -> u64 {

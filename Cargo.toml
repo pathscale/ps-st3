@@ -38,6 +38,11 @@ crossbeam-queue = { version = "0.3.12", default-features = false, features = [
 spin = { version = "0.9", default-features = false, features = [
     "spin_mutex",
 ], optional = true }
+# The `host` parker. A condition variable costs a mutex on every wake, and this
+# pool's wakes are its hot path; `atomic-wait` is a futex on Linux, `WaitOnAddress`
+# on Windows and `__ulock_wait` on macOS, so an uncontended park or unpark is one
+# atomic and, when nobody has to sleep, no system call at all.
+atomic-wait = { version = "1.1", optional = true }
 
 [features]
 default = ["fanout"]
@@ -50,7 +55,7 @@ fanout = ["dep:spin", "dep:crossbeam-queue"]
 # The OS substrate for `fanout`: threads, parking, a clock. The pool itself is
 # `no_std` and knows nothing about any of it, so a target without an OS links
 # the pool alone and brings its own `Host`.
-host = ["fanout"]
+host = ["fanout", "dep:atomic-wait"]
 
 [dev-dependencies]
 criterion = "0.3"

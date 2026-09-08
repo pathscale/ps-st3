@@ -77,6 +77,14 @@ pub struct Tuning {
     pub rounds_before_park: u32,
     /// How long to wait between two empty rounds, in spin-loop hints.
     pub backoff_spins: u32,
+    /// How many jobs a worker takes off the injector in one trip.
+    ///
+    /// The injector is the one queue every worker contends on, so the trip is
+    /// the expensive part and what lands in the worker's own queue costs
+    /// nothing to run. Larger means fewer trips and a longer stretch of
+    /// contention-free work; too large and one worker holds a backlog its
+    /// neighbours cannot see until the next heartbeat.
+    pub injector_batch: usize,
     /// How many jobs a worker runs between two looks at whether anyone needs
     /// work shared with them.
     ///
@@ -93,6 +101,7 @@ impl Default for Tuning {
             rounds_before_park: ROUNDS_BEFORE_PARK,
             backoff_spins: BACKOFF_SPINS,
             promote_every: PROMOTE_EVERY,
+            injector_batch: PULL_BATCH,
         }
     }
 }
@@ -112,7 +121,31 @@ impl Default for Tuning {
 const ROUNDS_BEFORE_PARK: u32 = 64;
 
 /// How long to wait between two empty rounds.
-const BACKOFF_SPINS: u32 = 64;
+///
+/// **This is worth more than anything else in this pool.** A worker that finds
+/// nothing looks again, and looking means a pop off the injector and a probe of
+/// every other worker's deque. Eight idle workers doing that in a tight loop
+/// take the very lines the producer is trying to fill, so the pool starves
+/// itself: the same 100,000 tasks that one worker finishes in 12.4 ms took
+/// eight workers 49.2 ms.
+///
+/// Swept over 100,000 tasks on 8 workers, with wake latency measured separately
+/// on an idle pool over 2,000 samples:
+///
+/// ```text
+/// spins     wall      cpu    latency median   p99
+///    64   49.2 ms   440 ms         3917 ns   10333 ns
+///   256   36.0 ms   325 ms         2500 ns    7958 ns
+///  1024   30.3 ms   277 ms         2375 ns    6000 ns
+///  4096   24.4 ms   237 ms         3375 ns   14209 ns
+/// 16384   15.6 ms   213 ms        21000 ns   43375 ns
+/// ```
+///
+/// 1024 is the last value that is better than the one before it on **every**
+/// axis, so it is the default. Past it the trade is real: 16384 is three times
+/// the throughput of 64 and five times the wake latency, which is the right
+/// choice for a batch pool and the wrong one for anything waiting on a reply.
+const BACKOFF_SPINS: u32 = 1024;
 
 /// Jobs run between two heartbeats.
 const PROMOTE_EVERY: u64 = 64;
@@ -598,7 +631,7 @@ impl Pool {
     /// its next heartbeat.
     fn take_from_injector(&self, mine: &mut VecDeque<Job>) -> usize {
         let mut taken = 0;
-        while taken < PULL_BATCH {
+        while taken < self.tuning.injector_batch {
             match self.injector.pop() {
                 Some(job) => {
                     mine.push_back(job);

@@ -54,7 +54,7 @@ mod host;
 mod job;
 #[cfg(feature = "host")]
 pub use host::StdHost;
-pub use job::Job;
+pub use job::{Act, Job};
 
 /// The most tasks one steal moves, before halving.
 ///
@@ -249,16 +249,25 @@ pub struct Pool {
     host: Arc<dyn Host>,
     running: AtomicBool,
     tuning: Tuning,
-    /// Round-robin cursor for choosing which worker a hintless submit nudges.
-    next_hint: AtomicUsize,
-    /// How many workers are asleep right now.
+    /// One bit per worker that is asleep or about to be.
     ///
-    /// **Not the wake mechanism**, which is per-worker and needs no shared
-    /// state; this is only so a worker can skip sharing its private queue when
-    /// there is nobody to share with. It is `Relaxed` and touched only when a
-    /// worker actually parks or wakes, which the backoff makes rare, so it is
-    /// not the contended line the sleeper bitmap it replaces was.
-    asleep: AtomicUsize,
+    /// **Read on submit, written only on an actual park.** A submit that wakes
+    /// only the worker it was handed leaves an available worker asleep while a
+    /// busy one takes the notification, and with no park timeout nothing
+    /// corrects that until the busy worker finishes: the latency of unrelated
+    /// work, added to a job that had somewhere to go.
+    ///
+    /// So a submit reads this and wakes a worker that is genuinely asleep. The
+    /// cost is one load, not the read-modify-write the first version of this
+    /// pool did per submit and which serialised the whole thing.
+    ///
+    /// **`SeqCst`, and it has to be.** A worker sets its bit and *then* takes
+    /// its last look at the injector; a submit publishes and *then* reads this.
+    /// That is a store-then-load on each side against different locations, and
+    /// only a total order across both makes one of them see the other. With
+    /// weaker orderings both can miss, and the worker sleeps on work that is
+    /// already queued.
+    sleeping: AtomicUsize,
 }
 
 impl Pool {
@@ -303,6 +312,16 @@ impl Pool {
         host: Arc<dyn Host>,
         tuning: Tuning,
     ) -> Arc<Self> {
+        assert!(workers > 0, "a pool needs at least one worker");
+        assert!(
+            tuning.promote_every > 0,
+            "`promote_every` is a countdown to zero: 0 never reaches it"
+        );
+        assert!(
+            tuning.injector_batch > 0,
+            "`injector_batch` of 0 takes nothing off the injector, so submitted \
+             work would never run and shutdown would never finish"
+        );
         assert!(
             workers <= usize::BITS as usize,
             "a pool is one bit per worker in a usize: {workers} workers is more than {} ",
@@ -326,8 +345,7 @@ impl Pool {
             injector: SegQueue::new(),
             running: AtomicBool::new(true),
             tuning,
-            next_hint: AtomicUsize::new(0),
-            asleep: AtomicUsize::new(0),
+            sleeping: AtomicUsize::new(0),
         })
     }
 
@@ -376,7 +394,7 @@ impl Pool {
     /// pointer and a [`Job`] holds a thin one. [`Pool::submit_fn`] costs one
     /// and is otherwise identical.
     pub fn submit(&self, worker: usize, task: Task) {
-        self.push(worker, Job::from_boxed(task));
+        self.push(Some(worker), Job::from_boxed(task));
     }
 
     /// Hand a closure to the pool, allocating once.
@@ -387,7 +405,7 @@ impl Pool {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.push(self.hint(), Job::from_boxed(work));
+        self.push(None, Job::from_boxed(work));
     }
 
     /// Hand the pool work it does not have to allocate for.
@@ -396,51 +414,52 @@ impl Pool {
     /// a slot in an arena, a future something else has already boxed. See
     /// [`Job::from_raw`] for what the caller has to guarantee.
     pub fn submit_job(&self, job: Job) {
-        self.push(self.hint(), job);
-    }
-
-    /// Round-robin, for submitters that expressed no preference. It only
-    /// chooses who to *wake*, so a poor choice costs a wakeup and not a task.
-    fn hint(&self) -> usize {
-        self.next_hint.fetch_add(1, Ordering::Relaxed) % self.workers()
+        self.push(None, job);
     }
 
     /// Publish one job and make sure somebody will look.
-    fn push(&self, worker: usize, job: Job) {
+    fn push(&self, hint: Option<usize>, job: Job) {
         self.injector.push(job);
-        // **Unconditionally, and without asking who is asleep.** There used to
-        // be a pool-wide bitmap of sleepers, consulted here so the unpark could
-        // be skipped when nobody was on the other end. That bitmap was one
-        // cache line taking a `SeqCst` read-modify-write from every worker that
-        // parked and every submit that looked, and it cost more than the wake
-        // it saved: parking sooner made the pool spend 818 ms of CPU against
-        // 445. `Host::unpark` on a running worker is now a single swap of that
-        // worker's own padded word, with no system call, so asking first buys
-        // nothing.
-        //
-        // The race is closed by the park protocol rather than here: a worker
-        // that looks at the injector, finds it empty, and then parks finds the
-        // signal this leaves and does not sleep. See `StdHost::park`.
-        self.host.unpark(worker);
+        self.wake(hint);
+    }
+
+    /// Get one worker looking, preferring one that is actually asleep.
+    ///
+    /// The `hint` is only a fallback. Waking the hinted worker when it is busy
+    /// and another is parked is the bug this exists to avoid: the job waits out
+    /// unrelated work while a free worker sleeps beside it.
+    fn wake(&self, hint: Option<usize>) {
+        // Ordered against publishing the job above; see `sleeping`.
+        let sleeping = self.sleeping.load(Ordering::SeqCst);
+        if sleeping != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let candidate = sleeping.trailing_zeros() as usize;
+            self.host.unpark(candidate);
+            return;
+        }
+        // Nobody has announced sleep. A worker may still be between its last
+        // look and its park, and the permit `unpark` leaves is what stops that
+        // one sleeping on this job.
+        if let Some(worker) = hint {
+            self.host.unpark(worker);
+        }
     }
 
     /// Tell some worker other than `except` that there may be work about.
     ///
-    /// Round-robin rather than "whoever is asleep", because knowing who is
-    /// asleep needs a shared bitmap and that bitmap was this pool's most
-    /// contended line. A signal to a worker that is already running is one swap
-    /// of its own padded word, so the worst a wrong guess costs is one wasted
-    /// pass around that worker's loop.
+    /// Used when work becomes *stealable* rather than newly submitted: a batch
+    /// pulled off the injector, or a private queue shared on the heartbeat.
     fn nudge(&self, except: Option<usize>) {
-        let workers = self.workers();
-        if workers < 2 {
-            return;
+        let spare = match except {
+            Some(id) => 1usize << id,
+            None => 0,
+        };
+        let sleeping = self.sleeping.load(Ordering::SeqCst) & !spare;
+        if sleeping != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let candidate = sleeping.trailing_zeros() as usize;
+            self.host.unpark(candidate);
         }
-        let mut candidate = self.next_hint.fetch_add(1, Ordering::Relaxed) % workers;
-        if Some(candidate) == except {
-            candidate = (candidate + 1) % workers;
-        }
-        self.host.unpark(candidate);
     }
 
     /// Tell every worker to stop once it runs out of work, and wake them all.
@@ -501,7 +520,11 @@ impl Pool {
         // `forte`, `chili` and Spice all arrived at: pay for sharing on a
         // timer, not on every task.
         let mut mine: VecDeque<Job> = VecDeque::new();
-        let mut tick = 0u64;
+        // A countdown rather than a modulus. `tick % promote_every` is a
+        // runtime `u64` remainder on the hot path for a value that only has to
+        // reach zero, and it made the interval depend on an absolute count,
+        // which is what let it align with an empty queue.
+        let mut until_promote = self.tuning.promote_every;
         let mut spins = 0u32;
         let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (w.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
@@ -509,8 +532,9 @@ impl Pool {
             // 1. This worker's own queue. No synchronisation whatsoever.
             if let Some(job) = mine.pop_back() {
                 spins = 0;
-                tick = tick.wrapping_add(1);
-                if tick % self.tuning.promote_every == 0 {
+                until_promote -= 1;
+                if until_promote == 0 {
+                    until_promote = self.tuning.promote_every;
                     self.promote(&mut mine, &queue, w.id);
                 }
                 job.run();
@@ -536,11 +560,31 @@ impl Pool {
             //    worker contends on.
             if self.take_from_injector(&mut mine) > 0 {
                 spins = 0;
+                // **Share at the refill, not only on the countdown.** A batch
+                // off the injector is the one moment this worker is known to
+                // hold more than it needs, and the countdown alone could never
+                // catch it: with the default batch of 32 and a heartbeat of 64,
+                // every heartbeat landed on the last job of the second batch,
+                // when the private queue was empty. The mechanism fired
+                // forever and shared nothing.
+                self.promote(&mut mine, &queue, w.id);
+                until_promote = self.tuning.promote_every;
                 continue;
             }
 
-            // Nothing found this round. Look again before announcing anything:
-            // see `Tuning::rounds_before_park` for why the wake, not the park,
+            // Nothing found this round, and nothing left to run. Shutdown is
+            // checked **here**, not only on the park path below: a worker with
+            // a large `rounds_before_park` would otherwise spin out its whole
+            // budget before ever asking, and one with a budget large enough
+            // would never ask at all and `run` would never return. Found by
+            // trying to make the idle-CPU test fail on a pool that never parks,
+            // which hung instead.
+            if !self.is_running() {
+                break;
+            }
+
+            // Look again before announcing anything: see
+            // `Tuning::rounds_before_park` for why the wake, not the park,
             // costs.
             if spins < self.tuning.rounds_before_park {
                 spins += 1;
@@ -555,22 +599,30 @@ impl Pool {
                 continue;
             }
 
-            // Nothing anywhere, so this worker sleeps. One last look at the
-            // injector first, and then the park protocol closes the race: a
-            // submit landing after this look leaves a signal that `park`
-            // consumes instead of sleeping on.
+            // Nothing anywhere, so this worker sleeps.
+            //
+            // **Announce first, then look.** A submit publishes its job and
+            // then reads the bitmap; this sets its bit and then reads the
+            // injector. Two store-then-load pairs against different locations,
+            // so only `SeqCst` on all four makes at least one of them see the
+            // other. Announcing after the look, or announcing with a weaker
+            // ordering, lets a worker sleep on a job that is already queued.
+            let bit = 1usize << w.id;
+            self.sleeping.fetch_or(bit, Ordering::SeqCst);
+
             if !self.injector.is_empty() {
+                self.sleeping.fetch_and(!bit, Ordering::SeqCst);
                 continue;
             }
             // Checked before parking so a worker cannot sleep through the end;
             // `shut_down` unparks every worker, so one that gets past this
             // still leaves.
             if !self.is_running() {
+                self.sleeping.fetch_and(!bit, Ordering::SeqCst);
                 break;
             }
-            self.asleep.fetch_add(1, Ordering::Relaxed);
             self.host.park(w.id);
-            self.asleep.fetch_sub(1, Ordering::Relaxed);
+            self.sleeping.fetch_and(!bit, Ordering::SeqCst);
             spins = 0;
         }
 
@@ -629,7 +681,10 @@ impl Pool {
     /// argument and it is why the private queue is a deque rather than a stack.
     #[cold]
     fn promote(&self, mine: &mut VecDeque<Job>, queue: &Queue<Job>, id: usize) {
-        if self.asleep.load(Ordering::Relaxed) == 0 {
+        // Nothing to share, or nobody to share it with. The second is a
+        // `Relaxed` load: a sleeper missed here waits for the next refill or
+        // the next countdown, and both are close.
+        if mine.len() < 2 || self.sleeping.load(Ordering::Relaxed) == 0 {
             return;
         }
         let share = mine.len() / 2;
@@ -706,7 +761,10 @@ impl core::fmt::Debug for Pool {
         f.debug_struct("Pool")
             .field("workers", &self.workers())
             .field("running", &self.is_running())
-            .field("asleep", &self.asleep.load(Ordering::Relaxed))
+            .field(
+                "asleep",
+                &self.sleeping.load(Ordering::Relaxed).count_ones(),
+            )
             .finish_non_exhaustive()
     }
 }

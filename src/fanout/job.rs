@@ -23,16 +23,41 @@
 //! wrong function with the wrong pointer and it is a type confusion.
 
 use alloc::boxed::Box;
+use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
-/// A unit of work, type-erased into a pointer and the function that runs it.
+/// What to do with a job's allocation.
+///
+/// One callback rather than two, so a [`Job`] stays two words. A queue of jobs
+/// is a queue of these, and a third word would cost a third of the queue's
+/// cache footprint to save a branch that predicts perfectly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Act {
+    /// Run the work, then release it.
+    Run,
+    /// Release the work **without running it**, because the job is being
+    /// dropped rather than executed.
+    Drop,
+}
+
+/// A unit of work, type-erased into a pointer and the function that owns it.
 ///
 /// Running a job consumes it. There is no `Copy` and no `Clone` on purpose:
 /// two jobs naming one allocation would run it twice, and the second run is a
 /// use-after-free.
+///
+/// # Dropping one without running it
+///
+/// **A `Job` owns its work, and dropping one releases it.** That is why the
+/// callback takes an [`Act`] rather than being a bare `execute`: a queue that
+/// is dropped with work still in it, a pool shut down with jobs pending, or a
+/// worker unwinding with a private queue, all have to release those closures
+/// and whatever they captured. `Box<dyn FnOnce()>`, which this replaced, did
+/// that for free; getting it wrong here would leak buffers and reference counts
+/// for the life of a process.
 pub struct Job {
     pointer: NonNull<()>,
-    execute: unsafe fn(NonNull<()>),
+    handle: unsafe fn(NonNull<()>, Act),
 }
 
 // SAFETY: a `Job` is only ever built by `Job::from_boxed` or by
@@ -50,21 +75,27 @@ impl Job {
     where
         F: FnOnce() + Send + 'static,
     {
-        unsafe fn execute<F: FnOnce() + Send + 'static>(pointer: NonNull<()>) {
+        unsafe fn handle<F: FnOnce() + Send + 'static>(pointer: NonNull<()>, act: Act) {
             // SAFETY: the only way this function reaches a pointer is through
             // the `Job` built beside it below, whose pointer came from
-            // `Box::into_raw` on a `Box<F>` for this same `F` and has not been
-            // run before, because running consumes the job. The body of an
-            // `unsafe fn` is already an unsafe block on this edition.
+            // `Box::into_raw` on a `Box<F>` for this same `F`, and it is
+            // reached at most once because both running and dropping consume
+            // the job. The body of an `unsafe fn` is already an unsafe block on
+            // this edition.
             let work = Box::from_raw(pointer.as_ptr().cast::<F>());
-            work();
+            match act {
+                // The box goes out of scope either way; this is the only
+                // difference, and it is what stops a dropped job running.
+                Act::Run => work(),
+                Act::Drop => drop(work),
+            }
         }
 
         let pointer = Box::into_raw(Box::new(work)).cast::<()>();
         Self {
             // SAFETY: `Box::into_raw` never returns null.
             pointer: unsafe { NonNull::new_unchecked(pointer) },
-            execute: execute::<F>,
+            handle: handle::<F>,
         }
     }
 
@@ -78,29 +109,49 @@ impl Job {
     ///
     /// The caller must ensure all of:
     ///
-    /// * `execute` is correct for whatever `pointer` points at, and running it
-    ///   on that pointer is sound.
+    /// * `handle` is correct for whatever `pointer` points at, and both
+    ///   [`Act::Run`] and [`Act::Drop`] on that pointer are sound. **A `Job`
+    ///   owns its work**: `Act::Drop` has to release the allocation without
+    ///   running it, or a queue dropped with work in it leaks.
     /// * `pointer` stays valid until the job runs. The pool gives no bound on
     ///   when that is, and a job may outlive the thread that submitted it.
     /// * The work behind `pointer` is `Send`, because the job will very likely
     ///   run on a different thread.
-    /// * `execute` does not unwind. A panic crossing a worker's run loop takes
+    /// * `handle` does not unwind. A panic crossing a worker's run loop takes
     ///   the worker's deque with it.
     /// * This job is the only one naming `pointer`, since running consumes the
     ///   pointer's ownership.
     // Not `const`: a function pointer in a `const fn` is 1.61, and this crate
     // holds a 1.60 floor.
     #[must_use]
-    pub unsafe fn from_raw(pointer: NonNull<()>, execute: unsafe fn(NonNull<()>)) -> Self {
-        Self { pointer, execute }
+    pub unsafe fn from_raw(pointer: NonNull<()>, handle: unsafe fn(NonNull<()>, Act)) -> Self {
+        Self { pointer, handle }
     }
 
     /// Run the work, consuming the job.
     pub(crate) fn run(self) {
-        // SAFETY: `from_boxed` pairs a `Box<F>` pointer with `execute::<F>`,
-        // and `from_raw` makes the pairing the caller's obligation. Consuming
-        // `self` is what stops a second run.
-        unsafe { (self.execute)(self.pointer) }
+        // `Drop` would otherwise release the work a second time after running
+        // it. `ManuallyDrop` is what makes running and dropping exclusive.
+        let job = ManuallyDrop::new(self);
+        // SAFETY: `from_boxed` pairs a `Box<F>` pointer with `handle::<F>`, and
+        // `from_raw` makes the pairing the caller's obligation. The handle is
+        // reached once: `ManuallyDrop` above stops the destructor, and taking
+        // `self` by value stops a second call.
+        unsafe { (job.handle)(job.pointer, Act::Run) }
+    }
+}
+
+/// Releases the work without running it.
+///
+/// The case that matters is a queue dropped with jobs still in it: a pool shut
+/// down with work pending, or a worker unwinding while holding a private queue.
+/// Those closures own whatever they captured, and nothing else will release it.
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: as in `run`, and this is the other of the two exclusive
+        // paths: `run` consumes the job through `ManuallyDrop`, so a job that
+        // reaches here has not been run and will not be.
+        unsafe { (self.handle)(self.pointer, Act::Drop) }
     }
 }
 

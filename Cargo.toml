@@ -55,6 +55,12 @@ fanout = ["dep:spin", "dep:crossbeam-queue"]
 # The OS substrate for `fanout`: threads, parking, a clock. The pool itself is
 # `no_std` and knows nothing about any of it, so a target without an OS links
 # the pool alone and brings its own `Host`.
+#
+# **This feature has a higher minimum than the crate.** `rust-version` above is
+# 1.60 and holds for the queues and for `fanout`. `host` pulls `atomic-wait`,
+# which on Linux, Android and FreeBSD depends on `libc`, and `libc` 0.2.189
+# requires **1.65**. macOS and Windows do not pull it. CI checks 1.60 without
+# this feature for that reason.
 host = ["fanout", "dep:atomic-wait"]
 
 [dev-dependencies]

@@ -6,6 +6,16 @@
 //! methods, `park`, `unpark` and `now_ns`. This is what those look like when
 //! there is a `std` to implement them with, and it is the reference a target
 //! without one replaces.
+//!
+//! # Minimum Rust version, and platforms
+//!
+//! **This feature needs more than the crate does.** The crate holds a 1.60
+//! floor; `atomic-wait` here depends on `libc` on Linux, Android and FreeBSD,
+//! and `libc` 0.2.189 requires 1.65. macOS and Windows pull nothing extra.
+//!
+//! Parking is `futex` on Linux, `WaitOnAddress` on Windows, `__ulock_wait` on
+//! macOS, and `_umtx_op` on FreeBSD. A platform outside that set has no
+//! `StdHost`; it has a [`Host`] trait to implement, which is the point.
 
 use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -101,13 +111,20 @@ impl Host for StdHost {
     /// hang, and long enough that idling is free.
     fn park(&self, worker: usize) {
         let state = &self.slots[worker].state;
-        // Announce sleep and read what was there in one operation. `Relaxed` is
-        // enough: this and `unpark` swap the same word, and a single atomic's
-        // modification order is total whatever the ordering asks for, so one of
-        // the two always sees the other.
-        if state.swap(ASLEEP, Ordering::Relaxed) != LOCKED {
+        // **`Acquire`, not `Relaxed`.** Total modification order on this word
+        // proves which transition happened first and *nothing* about what the
+        // unparker wrote before it. Consuming a permit has to acquire the
+        // publication that preceded it, or a worker can take the shutdown
+        // notification and then read `running` as `true`, park again, and never
+        // be told a second time.
+        if state.swap(ASLEEP, Ordering::Acquire) != LOCKED {
             // A signal arrived first. Take it and do not sleep.
-            state.store(LOCKED, Ordering::Relaxed);
+            //
+            // Compare-exchange rather than a store: another unpark may have
+            // landed since the swap above, and its permit has to survive rather
+            // than be overwritten with `LOCKED`. A failure here means exactly
+            // that, and leaving `SIGNAL` in place is the right outcome.
+            let _ = state.compare_exchange(ASLEEP, LOCKED, Ordering::Acquire, Ordering::Relaxed);
             return;
         }
         // **No timeout.** `Pool` publishes work and then unparks, and
@@ -120,7 +137,10 @@ impl Host for StdHost {
                 self.spurious.fetch_add(1, Ordering::Relaxed);
             }
         }
-        state.store(LOCKED, Ordering::Relaxed);
+        // Consume the permit that ended the wait, and only that one. A plain
+        // store would clear a *newer* permit that arrived between the loop
+        // exiting and this line, which is a lost wakeup.
+        let _ = state.compare_exchange(SIGNAL, LOCKED, Ordering::Acquire, Ordering::Relaxed);
     }
 
     fn unpark(&self, worker: usize) {

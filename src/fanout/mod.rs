@@ -538,7 +538,7 @@ impl Pool {
                 spins += 1;
                 // Back off *without* touching anything shared. Looking again
                 // means a pop off the injector and a probe of every other
-                // worker's queue, so an empty round is not free to anyone else:
+                // worker's deque, so an empty round is not free to anyone else:
                 // repeating it immediately is what starves the producer this is
                 // trying to keep fed.
                 for _ in 0..self.tuning.backoff_spins {

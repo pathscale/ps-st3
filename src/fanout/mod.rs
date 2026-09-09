@@ -125,12 +125,71 @@ pub struct Tuning {
 
 impl Default for Tuning {
     fn default() -> Self {
+        Self::locality()
+    }
+}
+
+impl Tuning {
+    /// Keep a woken task on the worker that woke it.
+    ///
+    /// For work whose wakes are a **chain**: a task releases something and the
+    /// task it releases wants the lines the first one just touched. Update-heavy
+    /// storage paths look like this, and so does anything with a lock handoff.
+    ///
+    /// Measured on YCSB at eight threads against a tokio-driven build of the
+    /// same storage engine: 50% update +6.4%, read-modify-write +2.0%, where
+    /// [`Tuning::spread`] puts both about 40% behind.
+    ///
+    /// This is [`Tuning::default`], because being 19% behind on one shape beats
+    /// being 40% behind on two.
+    #[must_use]
+    pub fn locality() -> Self {
         Self {
             rounds_before_park: ROUNDS_BEFORE_PARK,
             backoff_spins: BACKOFF_SPINS,
             promote_every: PROMOTE_EVERY,
             injector_batch: INJECTOR_BATCH,
             local_wakes: true,
+        }
+    }
+
+    /// Send every wake to the injector, where any worker can take it.
+    ///
+    /// For work whose wakes are **independent**: the woken task has no claim on
+    /// the waking worker's cache and would rather run now, somewhere else, than
+    /// wait behind it. Read-mostly and insert-mostly paths look like this.
+    ///
+    /// Measured on the same YCSB runs: 95% read / 5% update +74.4%, 95% read /
+    /// 5% insert +321.6%, where [`Tuning::locality`] is 19% behind on the first
+    /// and less than half as fast on the second.
+    ///
+    /// The cost is the other column: update-heavy work goes about 40% behind.
+    /// There is no setting that wins both, which is why this is a choice and
+    /// not a default.
+    #[must_use]
+    pub fn spread() -> Self {
+        Self {
+            local_wakes: false,
+            ..Self::locality()
+        }
+    }
+
+    /// Fewer, larger trips to the injector.
+    ///
+    /// For a firehose of short independent jobs submitted from outside the
+    /// pool, where the trip to the shared queue is the cost and nothing wants
+    /// locality. This is what the defaults were before `local_wakes` existed.
+    ///
+    /// **Do not combine a large batch with `local_wakes`.** A worker taking
+    /// eight long-lived tasks off the injector keeps all eight, because each
+    /// one's self-wake returns it to that worker: measured, a read-only run
+    /// went from 15.2M ops/s to 8.9M against tokio's 21.6M.
+    #[must_use]
+    pub fn throughput() -> Self {
+        Self {
+            local_wakes: false,
+            injector_batch: 8,
+            ..Self::locality()
         }
     }
 }

@@ -152,31 +152,16 @@ const PROMOTE_EVERY: u64 = 64;
 
 /// Jobs a worker takes off the injector in one trip.
 ///
-/// **One, and the reason is worth reading before raising it.**
+/// **This is the bound on stranding.** What a worker takes goes into its
+/// private queue; half of that is published for stealing at once, and the rest
+/// is unreachable until the worker pops again. A worker that takes a batch and
+/// then starts one long job strands the private half for the whole of it.
 ///
-/// Batching looks free on a benchmark of identical trivial tasks, because with
-/// every job the same length nothing can queue behind anything. Swept at 8, 32
-/// and 128 over 100,000 such tasks: 49.2, 48.3 and 50.3 ms. That fixture cannot
-/// see what batching costs.
-///
-/// On a burst of *mixed* durations, 20,000 jobs with one in twenty about a
-/// hundred times longer, makespan is flat across every batch size and the
-/// latency from submit to start is monotonic in it:
-///
-/// ```text
-/// batch   makespan       p50         p99         max
-///     1    5.5 ms    4333 ns    25458 ns    32959 ns
-///     2    5.6 ms    5291 ns    28209 ns    39375 ns
-///     4    5.7 ms    7583 ns    29834 ns    44042 ns
-///     8    5.2 ms    8417 ns    30417 ns    45250 ns
-///    32    5.8 ms   13875 ns   122083 ns   196083 ns
-/// ```
-///
-/// A batch is a job's exposure to whatever is in front of it, and to whatever
-/// its worker takes private and then sits on while it runs something long.
-/// Buying nothing and costing that, it should be one. `nagoya`'s `burst`
-/// example is where those numbers come from.
-const INJECTOR_BATCH: usize = 1;
+/// Swept at 8, 32 and 128 over 100,000 tasks: 49.2, 48.3 and 50.3 ms, so the
+/// size buys no throughput. Given that, it should be as small as the injector
+/// traffic tolerates, because it is paid for in latency for anybody stuck
+/// behind a long job.
+const INJECTOR_BATCH: usize = 8;
 
 /// A unit of work, as a boxed closure.
 ///

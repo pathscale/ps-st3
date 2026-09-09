@@ -502,11 +502,18 @@ impl Pool {
         if let Some(displaced) = displaced {
             self.local[worker].inbox.push(displaced);
         }
-        // Ordered as in `push`: publish, then read the bitmap. A worker on its
-        // way to sleep sets its bit and then re-checks its own inbox, so one of
-        // the two sees the other and the job is never left on a sleeping
-        // worker. The common case, a worker feeding itself, reads an unset bit
-        // and does nothing.
+        // Publish, then read the bitmap, with a barrier between.
+        //
+        // **The fence is load-bearing and its absence was a lost wakeup.** The
+        // sleep path is a Dekker pair: the worker stores its bit and then reads
+        // the slot and the inbox, and this stores the job and then reads the
+        // bit. That only guarantees one side sees the other if *both* pairs are
+        // separated by a full barrier. The worker's `fetch_or` is `SeqCst` and
+        // is one; on this side the job went into a `spin::Mutex`, whose release
+        // is a store-release and is not. So both could miss, and both did:
+        // caught in a profile with all sixteen workers parked in `__ulock_wait`
+        // while the run had work outstanding, at a sixth of normal throughput.
+        core::sync::atomic::fence(Ordering::SeqCst);
         if self.sleeping.load(Ordering::SeqCst) & (1usize << worker) != 0 {
             self.wake(Some(worker));
         }

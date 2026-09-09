@@ -245,6 +245,19 @@ struct Local {
     /// out of `queue` by `run` and owned by the running thread for the whole
     /// loop; this is reachable while that is in flight.
     inbox: SegQueue<Job>,
+    /// The single most recent job this worker handed itself.
+    ///
+    /// A task that wakes itself almost always wants to run *next*, and going
+    /// through `inbox` to say so costs a `SegQueue` push and pop, which is an
+    /// MPMC structure priced for many producers. This is one uncontended
+    /// swap, and it is what tokio's LIFO slot is for. Measured, the inbox
+    /// alone left a read-only workload at a third of tokio's throughput
+    /// because it paid that queue on all five million wakes.
+    ///
+    /// Holds one job. A second self-wake displaces the first into `inbox`,
+    /// where it is still found, so nothing is lost and the slot never becomes
+    /// a queue of its own.
+    lifo: Mutex<Option<Job>>,
 }
 
 // Distinguishes one pool from another, so a `Runner` cannot be handed to the
@@ -361,6 +374,7 @@ impl Pool {
                 queue: Mutex::new(Some(queue)),
                 completed: AtomicUnsignedLong::new(0),
                 inbox: SegQueue::new(),
+                lifo: Mutex::new(None),
             }));
         }
         Arc::new(Self {
@@ -458,7 +472,12 @@ impl Pool {
     /// A worker that is asleep is woken, so this is still safe to call from
     /// another thread; it just has nothing to offer one.
     pub fn submit_local(&self, worker: usize, job: Job) {
-        self.local[worker].inbox.push(job);
+        // The slot first, and whatever it held goes to the inbox behind it.
+        // One swap on the common path, against a `SegQueue` push and pop.
+        let displaced = self.local[worker].lifo.lock().replace(job);
+        if let Some(displaced) = displaced {
+            self.local[worker].inbox.push(displaced);
+        }
         // Ordered as in `push`: publish, then read the bitmap. A worker on its
         // way to sleep sets its bit and then re-checks its own inbox, so one of
         // the two sees the other and the job is never left on a sleeping
@@ -580,7 +599,33 @@ impl Pool {
         let mut spins = 0u32;
         let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (w.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
+        // How many self-wakes may be served from the LIFO slot back to back
+        // before the loop insists on looking elsewhere. Without a bound, two
+        // tasks ping-ponging through the slot starve everything this worker
+        // holds, including work it has already promised to share.
+        let mut lifo_run = 0u32;
+        const LIFO_RUN_LIMIT: u32 = 32;
+
         loop {
+            // 0. The task that just woke itself, if there is one. Ahead of
+            //    everything: it is the warmest work in the process, and the
+            //    slot is one uncontended swap to check.
+            //    Written without a `let` chain: this crate supports Rust 1.60
+            //    and those are 2024.
+            let from_slot = if lifo_run < LIFO_RUN_LIMIT {
+                self.local[w.id].lifo.lock().take()
+            } else {
+                None
+            };
+            if let Some(job) = from_slot {
+                lifo_run += 1;
+                spins = 0;
+                job.run();
+                self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            lifo_run = 0;
+
             // 1. This worker's own queue. No synchronisation whatsoever.
             if let Some(job) = mine.pop_back() {
                 spins = 0;
@@ -710,7 +755,10 @@ impl Pool {
             // reason: `submit_local` publishes and then reads this bitmap, so
             // announcing before looking is what stops a worker sleeping on a
             // job already handed to it.
-            if !self.injector.is_empty() || !self.local[w.id].inbox.is_empty() {
+            if !self.injector.is_empty()
+                || !self.local[w.id].inbox.is_empty()
+                || self.local[w.id].lifo.lock().is_some()
+            {
                 self.sleeping.fetch_and(!bit, Ordering::SeqCst);
                 continue;
             }

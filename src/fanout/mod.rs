@@ -233,6 +233,18 @@ impl Runner {
 struct Local {
     queue: Mutex<Option<Queue<Job>>>,
     completed: AtomicUnsignedLong,
+    /// Work a worker gave back to itself, bypassing the injector.
+    ///
+    /// The private `mine` deque lives on the run loop's stack, so nothing
+    /// outside `run` can reach it. That left a task with no way back onto the
+    /// worker that woke it: every wake, and every `yield_now`, went through the
+    /// one injector every worker contends on, plus a wake. Under a workload
+    /// whose tasks yield in a retry loop that is the whole cost.
+    ///
+    /// A `SegQueue` rather than the sharing deque because that deque is moved
+    /// out of `queue` by `run` and owned by the running thread for the whole
+    /// loop; this is reachable while that is in flight.
+    inbox: SegQueue<Job>,
 }
 
 // Distinguishes one pool from another, so a `Runner` cannot be handed to the
@@ -348,6 +360,7 @@ impl Pool {
             local.push(CachePadded::new(Local {
                 queue: Mutex::new(Some(queue)),
                 completed: AtomicUnsignedLong::new(0),
+                inbox: SegQueue::new(),
             }));
         }
         Arc::new(Self {
@@ -428,6 +441,32 @@ impl Pool {
     /// [`Job::from_raw`] for what the caller has to guarantee.
     pub fn submit_job(&self, job: Job) {
         self.push(None, job);
+    }
+
+    /// Hand work straight to one worker, skipping the injector.
+    ///
+    /// For the caller that *is* that worker: a task rescheduling itself, or a
+    /// wake happening on a worker thread. Going through [`Pool::submit_job`]
+    /// there costs a push to the queue every worker contends on and a wake for
+    /// somebody who is already awake, and the job comes back to a random
+    /// worker rather than the one holding its cache lines.
+    ///
+    /// The job is **not** stealable until this worker promotes it, which is the
+    /// trade: locality and no contention, against a job that waits if this
+    /// worker then blocks. Only use it when the work belongs here.
+    ///
+    /// A worker that is asleep is woken, so this is still safe to call from
+    /// another thread; it just has nothing to offer one.
+    pub fn submit_local(&self, worker: usize, job: Job) {
+        self.local[worker].inbox.push(job);
+        // Ordered as in `push`: publish, then read the bitmap. A worker on its
+        // way to sleep sets its bit and then re-checks its own inbox, so one of
+        // the two sees the other and the job is never left on a sleeping
+        // worker. The common case, a worker feeding itself, reads an unset bit
+        // and does nothing.
+        if self.sleeping.load(Ordering::SeqCst) & (1usize << worker) != 0 {
+            self.wake(Some(worker));
+        }
     }
 
     /// Publish one job and make sure somebody will look.
@@ -555,6 +594,16 @@ impl Pool {
                 continue;
             }
 
+            // 1.5. What this worker handed back to itself. Before the sharing
+            //      deque because it is warmer and cheaper: no compare-exchange
+            //      against a thief, and it is where a yielded task lands.
+            if let Some(job) = self.local[w.id].inbox.pop() {
+                spins = 0;
+                job.run();
+                self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
             // 2. What this worker shared and nobody took.
             if let Some(job) = queue.pop() {
                 spins = 0;
@@ -634,7 +683,11 @@ impl Pool {
             let bit = 1usize << w.id;
             self.sleeping.fetch_or(bit, Ordering::SeqCst);
 
-            if !self.injector.is_empty() {
+            // The inbox is checked alongside the injector, and for the same
+            // reason: `submit_local` publishes and then reads this bitmap, so
+            // announcing before looking is what stops a worker sleeping on a
+            // job already handed to it.
+            if !self.injector.is_empty() || !self.local[w.id].inbox.is_empty() {
                 self.sleeping.fetch_and(!bit, Ordering::SeqCst);
                 continue;
             }

@@ -152,16 +152,25 @@ const PROMOTE_EVERY: u64 = 64;
 
 /// Jobs a worker takes off the injector in one trip.
 ///
-/// **This is the bound on stranding.** What a worker takes goes into its
-/// private queue; half of that is published for stealing at once, and the rest
-/// is unreachable until the worker pops again. A worker that takes a batch and
-/// then starts one long job strands the private half for the whole of it.
+/// **This is the bound on stranding, and one is the right bound now.**
+/// What a worker takes goes into its private queue; half is published for
+/// stealing at once, the rest is unreachable until it pops again.
 ///
-/// Swept at 8, 32 and 128 over 100,000 tasks: 49.2, 48.3 and 50.3 ms, so the
-/// size buys no throughput. Given that, it should be as small as the injector
-/// traffic tolerates, because it is paid for in latency for anybody stuck
-/// behind a long job.
-const INJECTOR_BATCH: usize = 8;
+/// It was 8, on a sweep over 100,000 independent short tasks that found 8, 32
+/// and 128 within noise of each other and concluded the size buys no
+/// throughput. That sweep is still true and no longer decisive, because
+/// `submit_local` changed what a batch costs. A job that wakes itself now
+/// stays on the worker that ran it, so a worker taking 8 long-lived tasks off
+/// the injector does not merely hold them until its next heartbeat: it keeps
+/// them. Measured on a read-only workload of 16 client tasks over 16 workers,
+/// a few workers held everything while the rest idled, and throughput sat at
+/// 8.9M ops/s against tokio's 21.6M. At a batch of 1 the same run reaches
+/// 15.2M, and the update-heavy workloads go from 41% behind tokio to 6% ahead.
+///
+/// So the earlier reading was right and its number was not: this should be as
+/// small as the injector traffic tolerates, and with self-wakes no longer
+/// returning through the injector, that traffic is small.
+const INJECTOR_BATCH: usize = 1;
 
 /// A unit of work, as a boxed closure.
 ///
@@ -306,6 +315,20 @@ pub struct Pool {
     /// weaker orderings both can miss, and the worker sleeps on work that is
     /// already queued.
     sleeping: AtomicUsize,
+    /// How many workers are currently hunting for work to steal.
+    ///
+    /// Capped at half the pool, which is the rule tokio's scheduler uses and
+    /// the reason is the same: a steal probe is a compare-exchange against the
+    /// victim's deque, so a worker looking for work **slows down the worker
+    /// that has it**. With every idle worker sweeping every victim each round,
+    /// that cost lands inside the busy workers' own pops, where no profile
+    /// attributes it to stealing: the leaf frames look like ordinary work and
+    /// throughput has a ceiling nobody can point at.
+    ///
+    /// Half, rather than a tuned number, because the useful range is bounded
+    /// on both sides. Too few searchers and work sits in a deque with nobody
+    /// coming for it; too many and they cost more than they redistribute.
+    searching: AtomicUsize,
 }
 
 impl Pool {
@@ -386,6 +409,7 @@ impl Pool {
             running: AtomicBool::new(true),
             tuning,
             sleeping: AtomicUsize::new(0),
+            searching: AtomicUsize::new(0),
         })
     }
 
@@ -680,10 +704,31 @@ impl Pool {
                 continue;
             }
 
-            // 3. Somebody else's.
-            if self.steal_once(&queue, w.id, &mut rng) > 0 {
-                spins = 0;
-                continue;
+            // 3. Somebody else's, but only if this worker is allowed to hunt.
+            //
+            //    See `Pool::searching`. Taking a slot before probing and giving
+            //    it back after is what bounds the number of workers whose
+            //    compare-exchanges are landing on the workers that are actually
+            //    getting things done.
+            let workers = self.workers();
+            let may_search = workers < 2 || {
+                let searchers = self.searching.fetch_add(1, Ordering::AcqRel);
+                if searchers * 2 >= workers {
+                    self.searching.fetch_sub(1, Ordering::AcqRel);
+                    false
+                } else {
+                    true
+                }
+            };
+            if may_search {
+                let stolen = self.steal_once(&queue, w.id, &mut rng);
+                if workers >= 2 {
+                    self.searching.fetch_sub(1, Ordering::AcqRel);
+                }
+                if stolen > 0 {
+                    spins = 0;
+                    continue;
+                }
             }
 
             // 4. What arrived from outside. Last, because it is the queue every

@@ -85,6 +85,34 @@ pub struct Tuning {
     /// contention-free work; too large and one worker holds a backlog its
     /// neighbours cannot see until the next heartbeat.
     pub injector_batch: usize,
+    /// Whether [`Pool::submit_local`] keeps work on the calling worker.
+    ///
+    /// `false` makes it forward to [`Pool::submit_job`], which is the whole of
+    /// the switch. It is a parameter because the right answer depends on the
+    /// workload and the two answers are far apart. Measured at eight threads
+    /// against a tokio-driven build of the same storage engine:
+    ///
+    /// ```text
+    /// workload                       local     injector
+    /// 50% update                      +6.4%      -40.2%
+    /// read-modify-write               +2.0%      -38.4%
+    /// 95% read / 5% update           -19.2%      +74.4%
+    /// 95% read / 5% insert          +137.1%     +321.6%
+    /// ```
+    ///
+    /// Contended work wants the handoff kept warm: its wakes are a chain, and
+    /// the successor wants the rows the releasing worker just touched. Sparse
+    /// work wants the opposite, because a rare wake queued behind a busy worker
+    /// waits while others sleep.
+    ///
+    /// `true` is the default because it is the better worst case: one workload
+    /// 19% behind, against two at about 40% behind the other way. There is no
+    /// static rule that gets both, and several were tried: gating on whether
+    /// the wake was a task waking *itself*, on whether any worker was idle, and
+    /// letting a thief take the slot on second sight. Each reproduced one
+    /// column or the other exactly.
+    pub local_wakes: bool,
+
     /// How many jobs a worker runs between two looks at whether anyone needs
     /// work shared with them.
     ///
@@ -102,6 +130,7 @@ impl Default for Tuning {
             backoff_spins: BACKOFF_SPINS,
             promote_every: PROMOTE_EVERY,
             injector_batch: INJECTOR_BATCH,
+            local_wakes: true,
         }
     }
 }
@@ -481,6 +510,17 @@ impl Pool {
         self.push(None, job);
     }
 
+    /// Whether any worker is currently parked.
+    ///
+    /// For a caller deciding between [`Pool::submit_local`] and
+    /// [`Pool::submit_job`]: locality is worth having when every worker is
+    /// busy, and worth nothing when the alternative is a job sitting behind
+    /// this worker's queue while another worker sleeps.
+    #[must_use]
+    pub fn has_idle_workers(&self) -> bool {
+        self.sleeping.load(Ordering::Acquire) != 0
+    }
+
     /// Hand work straight to one worker, skipping the injector.
     ///
     /// For the caller that *is* that worker: a task rescheduling itself, or a
@@ -496,6 +536,12 @@ impl Pool {
     /// A worker that is asleep is woken, so this is still safe to call from
     /// another thread; it just has nothing to offer one.
     pub fn submit_local(&self, worker: usize, job: Job) {
+        // Off by policy: see `Tuning::local_wakes` for the measurement behind
+        // this being a switch rather than a decision.
+        if !self.tuning.local_wakes {
+            self.push(None, job);
+            return;
+        }
         // The slot first, and whatever it held goes to the inbox behind it.
         // One swap on the common path, against a `SegQueue` push and pop.
         let displaced = self.local[worker].lifo.lock().replace(job);

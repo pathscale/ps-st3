@@ -1,3 +1,34 @@
+# 0.6.0 (2026-09-10)
+
+### Added
+
+- `Tuning`, the `fanout` pool's idle and wake policy, with three presets:
+  `Tuning::locality` (the default), `Tuning::spread` and `Tuning::throughput`.
+  Each carries the measurement that produced it in its doc comment, so a caller
+  chooses on evidence rather than on the name.
+- `Tuning::with_rounds_before_park`, `with_backoff_spins`, `with_injector_batch`,
+  `with_local_wakes` and `with_promote_every`, taking `self` by value so they
+  chain into `Pool::with_tuning`.
+- `Pool::submit_local`, which keeps a woken task on the worker that woke it.
+
+### Changed
+
+- `Pool` no longer wakes a sleeping worker when none is sleeping. The sleep path
+  is a Dekker pair, so publishing to a worker and then reading whether it sleeps
+  needs a full barrier on both sides; a `SeqCst` fence in `submit_local` closes
+  a lost wakeup that the spin-mutex release did not.
+- `INJECTOR_BATCH` is 1 rather than 8. Measured: a pure-read workload at sixteen
+  threads went from 8.9M to 15.2M operations per second.
+
+### Breaking
+
+- `Tuning` is `#[non_exhaustive]`, so it can gain a field without a major bump
+  next time. **This is why the bump is minor rather than patch**: a downstream
+  struct literal, including one using `..Default::default()`, no longer
+  compiles. Build one from `Tuning::locality()`, `spread()` or `throughput()`
+  and the `with_*` methods instead. Fields stay public to read, because callers
+  legitimately derive values from the defaults.
+
 # 0.5.0 (2026-09-06)
 
 ### Added

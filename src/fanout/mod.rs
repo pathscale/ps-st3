@@ -594,14 +594,37 @@ impl Pool {
                 continue;
             }
 
-            // 1.5. What this worker handed back to itself. Before the sharing
-            //      deque because it is warmer and cheaper: no compare-exchange
-            //      against a thief, and it is where a yielded task lands.
-            if let Some(job) = self.local[w.id].inbox.pop() {
-                spins = 0;
-                job.run();
-                self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
-                continue;
+            // 1.5. What this worker handed back to itself.
+            //
+            //      Moved into `mine` rather than run from here. Running it
+            //      directly looks cheaper and costs far more: a job in the
+            //      inbox is reachable by nobody, so a worker that keeps waking
+            //      its own tasks keeps them all, and the pool stops balancing.
+            //      Measured on a read-only workload with eight client tasks and
+            //      sixteen workers, that halved throughput and made it bimodal,
+            //      because tasks pinned to whichever worker first woke them
+            //      while other workers idled.
+            //
+            //      Through `mine` they are ordinary local work: LIFO, so a
+            //      task that just yielded still runs next and keeps its cache
+            //      lines, and subject to the same promotion that makes local
+            //      work stealable on the heartbeat.
+            {
+                let mut moved = 0usize;
+                while let Some(job) = self.local[w.id].inbox.pop() {
+                    mine.push_back(job);
+                    moved += 1;
+                    // Bounded so a producer feeding this inbox faster than the
+                    // worker drains it cannot spin here forever without running
+                    // anything.
+                    if moved >= self.tuning.promote_every as usize {
+                        break;
+                    }
+                }
+                if moved > 0 {
+                    spins = 0;
+                    continue;
+                }
             }
 
             // 2. What this worker shared and nobody took.

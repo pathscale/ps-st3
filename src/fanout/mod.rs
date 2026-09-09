@@ -71,7 +71,26 @@ pub const PULL_BATCH: usize = 32;
 /// arrives and on what else is running, so they are a parameter rather than a
 /// constant. [`Tuning::default`] is what was measured here, and the numbers
 /// that justify each field are on it.
+///
+/// # Building one
+///
+/// Start from a preset and change what you need:
+///
+/// ```
+/// use st3::fanout::Tuning;
+///
+/// let t = Tuning::spread().with_injector_batch(4);
+/// assert_eq!(t.injector_batch, 4);
+/// assert!(!t.local_wakes);
+/// ```
+///
+/// The fields stay public to read, so a caller can start from
+/// [`Tuning::default`] and derive a value from what it holds. The type is
+/// `#[non_exhaustive]`, so it cannot be built from a struct literal outside
+/// this crate, including with `..Tuning::default()`: more fields are coming
+/// and adding one should not break a downstream build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Tuning {
     /// Empty rounds a worker takes before it announces sleep.
     pub rounds_before_park: u32,
@@ -192,6 +211,45 @@ impl Tuning {
             ..Self::locality()
         }
     }
+
+    /// Set [`rounds_before_park`](Self::rounds_before_park).
+    #[must_use]
+    pub fn with_rounds_before_park(mut self, rounds: u32) -> Self {
+        self.rounds_before_park = rounds;
+        self
+    }
+
+    /// Set [`backoff_spins`](Self::backoff_spins).
+    #[must_use]
+    pub fn with_backoff_spins(mut self, spins: u32) -> Self {
+        self.backoff_spins = spins;
+        self
+    }
+
+    /// Set [`injector_batch`](Self::injector_batch).
+    #[must_use]
+    pub fn with_injector_batch(mut self, batch: usize) -> Self {
+        self.injector_batch = batch;
+        self
+    }
+
+    /// Set [`local_wakes`](Self::local_wakes).
+    ///
+    /// [`Tuning::locality`] and [`Tuning::spread`] are the two answers this
+    /// takes and the measurements behind them are on those constructors. Reach
+    /// for them rather than this unless you are sweeping the field.
+    #[must_use]
+    pub fn with_local_wakes(mut self, local_wakes: bool) -> Self {
+        self.local_wakes = local_wakes;
+        self
+    }
+
+    /// Set [`promote_every`](Self::promote_every).
+    #[must_use]
+    pub fn with_promote_every(mut self, jobs: u64) -> Self {
+        self.promote_every = jobs;
+        self
+    }
 }
 
 /// Empty rounds a worker takes before it announces sleep.
@@ -307,6 +365,7 @@ pub trait Host: Send + Sync {
 /// threads is still a caller error, and [`Pool::run`] refuses the second rather
 /// than racing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Runner {
     pool: usize,
     id: usize,

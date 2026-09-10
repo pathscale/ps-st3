@@ -104,6 +104,21 @@ pub struct Tuning {
     /// contention-free work; too large and one worker holds a backlog its
     /// neighbours cannot see until the next heartbeat.
     pub injector_batch: usize,
+    /// How many self-wakes may be served from the LIFO slot back to back
+    /// before the loop insists on looking elsewhere.
+    ///
+    /// The slot sits ahead of everything in the worker loop, so a task that
+    /// keeps waking itself is served from it indefinitely and the worker never
+    /// reaches the `mine.pop_back` that counts down to the heartbeat. Anything
+    /// this worker is holding for somebody else therefore never becomes
+    /// stealable, however long the queue behind it grows.
+    ///
+    /// Lower means the worker looks at its own queue sooner, which costs
+    /// nothing when there is nothing there: sharing returns immediately unless
+    /// the private queue holds at least two jobs. That is what makes this a
+    /// cheaper answer to a pile-up than routing displaced work to the injector,
+    /// which pays a wake whether or not anybody needed one.
+    pub lifo_run_limit: u32,
     /// Where a job displaced from the LIFO slot goes.
     ///
     /// `false`, the default, sends it to a private inbox behind the slot: one
@@ -191,6 +206,7 @@ impl Tuning {
     #[must_use]
     pub fn locality() -> Self {
         Self {
+            lifo_run_limit: LIFO_RUN_LIMIT,
             share_displaced: false,
             rounds_before_park: ROUNDS_BEFORE_PARK,
             backoff_spins: BACKOFF_SPINS,
@@ -240,6 +256,13 @@ impl Tuning {
         }
     }
 
+    /// Set [`lifo_run_limit`](Self::lifo_run_limit).
+    #[must_use]
+    pub fn with_lifo_run_limit(mut self, limit: u32) -> Self {
+        self.lifo_run_limit = limit;
+        self
+    }
+
     /// Set [`share_displaced`](Self::share_displaced).
     #[must_use]
     pub fn with_share_displaced(mut self, share: bool) -> Self {
@@ -286,6 +309,10 @@ impl Tuning {
         self
     }
 }
+
+/// Self-wakes served from the LIFO slot back to back before the worker looks
+/// at its own queue.
+const LIFO_RUN_LIMIT: u32 = 32;
 
 /// Empty rounds a worker takes before it announces sleep.
 ///
@@ -722,7 +749,34 @@ impl Pool {
         // one somebody else's to take.
         let displaced = self.local[worker].lifo.lock().replace(job);
         if let Some(displaced) = displaced {
-            if self.tuning.share_displaced {
+            // **The second displacement is the one that means something.**
+            //
+            // One task waking itself displaces nothing: it takes the slot,
+            // runs, and puts itself back into a slot the worker just emptied.
+            // Two tasks alternating displace each other, and the inbox behind
+            // the slot drains between them. Neither is an imbalance, and
+            // sending either to the injector would cost a wake for work that
+            // was going to be run here anyway. That is what made
+            // `share_displaced` lose 31% on a lock-bound update workload.
+            //
+            // A displacement arriving while the inbox is *already* occupied is
+            // different: it means a third task is queued behind two that this
+            // worker has not got to, which is the pile-up that cannot correct
+            // itself, because neither the slot nor the inbox is stealable and
+            // the slot starves the heartbeat that would share them.
+            //
+            // So under `share_displaced` the first one stays private and the
+            // rest go where anybody can reach them. Sharing from the *first*
+            // displacement was measured too and is worse on both sides: it
+            // took a lock-bound update workload from 943,606 to 651,554, and
+            // it did not buy anything the second-displacement rule does not.
+            //
+            // Off, this is the original behaviour: everything stays private.
+            // That is still the right default, because holding the line at one
+            // task costs 7% on lock-bound work for a tail that only appears on
+            // read-only work with many independent tasks. Which of those a
+            // table does is exactly what a flavor is for.
+            if self.tuning.share_displaced && !self.local[worker].inbox.is_empty() {
                 self.push(Some(worker), displaced);
             } else {
                 self.local[worker].inbox.push(displaced);
@@ -880,7 +934,7 @@ impl Pool {
         // tasks ping-ponging through the slot starve everything this worker
         // holds, including work it has already promised to share.
         let mut lifo_run = 0u32;
-        const LIFO_RUN_LIMIT: u32 = 32;
+        let lifo_run_limit = self.tuning.lifo_run_limit;
 
         loop {
             // 0. The task that just woke itself, if there is one. Ahead of
@@ -888,7 +942,7 @@ impl Pool {
             //    slot is one uncontended swap to check.
             //    Written without a `let` chain: this crate supports Rust 1.60
             //    and those are 2024.
-            let from_slot = if lifo_run < LIFO_RUN_LIMIT {
+            let from_slot = if lifo_run < lifo_run_limit {
                 self.local[w.id].lifo.lock().take()
             } else {
                 None

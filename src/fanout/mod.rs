@@ -825,11 +825,7 @@ impl Pool {
     /// and another is parked is the bug this exists to avoid: the job waits out
     /// unrelated work while a free worker sleeps beside it.
     fn wake(&self, hint: Option<usize>) {
-        // Ordered against publishing the job above; see `sleeping`.
-        let sleeping = self.sleeping.load(Ordering::SeqCst);
-        if sleeping != 0 {
-            #[allow(clippy::cast_possible_truncation)]
-            let candidate = sleeping.trailing_zeros() as usize;
+        if let Some(candidate) = self.claim_sleeper(0) {
             self.host.unpark(candidate);
             return;
         }
@@ -865,15 +861,52 @@ impl Pool {
             Some(id) => 1usize << id,
             None => 0,
         };
-        let mut sleeping = self.sleeping.load(Ordering::SeqCst) & !spare;
         for _ in 0..wanted {
-            if sleeping == 0 {
+            let Some(candidate) = self.claim_sleeper(spare) else {
                 return;
+            };
+            self.host.unpark(candidate);
+        }
+    }
+
+    /// Take one sleeper, rather than merely naming one.
+    ///
+    /// The bit says "announced sleep and not yet woken". Reading it and
+    /// unparking left the bit set until the woken worker actually ran, so a
+    /// burst of submits all read the same `trailing_zeros` candidate and
+    /// unparked one worker over and over while the rest stayed parked. The
+    /// wakes were all delivered; they all went to the same worker.
+    ///
+    /// Measured on a 16 core machine with 16 workers and 32 tasks, counting
+    /// cores kept busy (task CPU time over wall time, so 16.0 is the whole
+    /// machine and higher is better). A fresh pool held 12.7 of 16 cores busy.
+    /// Every pool that had parked once held 4.0, on repeat, for every tuning.
+    ///
+    /// Self-waking made no difference to it, which is what ruled out the LIFO
+    /// slot: a task polled exactly once cannot touch that machinery and
+    /// collapsed the same way. After this change the worst run of eight held
+    /// 10.3 of 16 cores busy rather than 2.9.
+    ///
+    /// `nudge_many` already masked each candidate it took, but only inside one
+    /// call. Clearing the bit here is that same rule, held across calls.
+    ///
+    /// Clearing early only claims the sleeper: the worker clears this itself
+    /// when it resumes and sets it again if it parks again, so a claim that
+    /// races a worker waking on its own costs nothing. The `SeqCst` read
+    /// stays ordered against publishing the job, and the read-modify-write is
+    /// no weaker.
+    fn claim_sleeper(&self, blocked: usize) -> Option<usize> {
+        loop {
+            let sleeping = self.sleeping.load(Ordering::SeqCst) & !blocked;
+            if sleeping == 0 {
+                return None;
             }
             #[allow(clippy::cast_possible_truncation)]
             let candidate = sleeping.trailing_zeros() as usize;
-            self.host.unpark(candidate);
-            sleeping &= !(1usize << candidate);
+            let bit = 1usize << candidate;
+            if self.sleeping.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+                return Some(candidate);
+            }
         }
     }
 
@@ -1294,5 +1327,107 @@ impl core::fmt::Debug for Pool {
                 &self.sleeping.load(Ordering::Relaxed).count_ones(),
             )
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(test, feature = "host"))]
+mod wake_distribution {
+    use super::{Host, Pool, Tuning};
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::Ordering;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// Records who was told to wake, and parks nobody.
+    ///
+    /// The pathology is about *which* worker each wake names, so the host only
+    /// has to remember the names.
+    struct RecordingHost {
+        unparked: Mutex<Vec<usize>>,
+    }
+
+    impl Host for RecordingHost {
+        fn park(&self, _worker: usize) {}
+        fn unpark(&self, worker: usize) {
+            self.unparked.lock().expect("no state a panic could corrupt").push(worker);
+        }
+        fn now_ns(&self) -> u64 {
+            0
+        }
+    }
+
+    /// A burst of submits must reach distinct sleepers.
+    ///
+    /// `wake` used to read `sleeping.trailing_zeros()` and unpark it without
+    /// clearing the bit, so every submit in a burst named the same worker: the
+    /// bit stays set until the woken worker actually runs. Every wake was
+    /// delivered and they all went to one worker, which is why it did not look
+    /// like a lost wakeup.
+    ///
+    /// Measured through `nagoya` on a 16 core machine, 16 workers and 32
+    /// tasks, counting cores kept busy (task CPU time over wall time, so 16.0
+    /// is the whole machine): a fresh pool held 12.7 busy and a pool that had
+    /// parked once held 4.0, on repeat, for every tuning. Tasks polled exactly
+    /// once collapsed identically to self-waking ones, which is what ruled out
+    /// the LIFO slot and named this instead.
+    #[test]
+    fn a_burst_of_wakes_reaches_distinct_sleepers() {
+        const WORKERS: usize = 8;
+
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(WORKERS, 64, host.clone(), Tuning::default());
+
+        // Everyone is asleep, which is the state a pool sits in between bursts
+        // of work and the state this used to collapse from.
+        pool.sleeping.store((1usize << WORKERS) - 1, Ordering::SeqCst);
+
+        for _ in 0..WORKERS {
+            pool.wake(None);
+        }
+
+        let unparked = host.unparked.lock().expect("the log").clone();
+        let distinct: HashSet<usize> = unparked.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            WORKERS,
+            "{WORKERS} submits against {WORKERS} sleepers woke {} distinct workers, {unparked:?}: \
+             a wake that names a sleeper without claiming it names the same one every time",
+            distinct.len()
+        );
+        assert_eq!(
+            pool.sleeping.load(Ordering::SeqCst),
+            0,
+            "a claimed sleeper must leave the bitmap, or the next submit picks it again"
+        );
+    }
+
+    /// `nudge_many` must not hand the same worker to two callers.
+    ///
+    /// It already masked each candidate inside one call, which is why the bug
+    /// above was invisible here. Two calls had no such memory.
+    #[test]
+    fn two_nudges_do_not_pick_the_same_sleeper() {
+        const WORKERS: usize = 8;
+
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(WORKERS, 64, host.clone(), Tuning::default());
+        pool.sleeping.store((1usize << WORKERS) - 1, Ordering::SeqCst);
+
+        pool.nudge_many(None, 3);
+        pool.nudge_many(None, 3);
+
+        let unparked = host.unparked.lock().expect("the log").clone();
+        let distinct: HashSet<usize> = unparked.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            6,
+            "two nudges of three woke {} distinct workers, {unparked:?}",
+            distinct.len()
+        );
     }
 }

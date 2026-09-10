@@ -777,7 +777,21 @@ impl Pool {
             // read-only work with many independent tasks. Which of those a
             // table does is exactly what a flavor is for.
             if self.tuning.share_displaced && !self.local[worker].inbox.is_empty() {
-                self.push(Some(worker), displaced);
+                // **Published, not announced.** `push` would also unpark a
+                // sleeper, and that wake is what made this expensive on
+                // lock-bound work: the woken worker steals the job, runs it,
+                // blocks on the same row lock, and parks again, so the pool
+                // pays a park/unpark round trip per displacement for work that
+                // was serialised anyway.
+                //
+                // The wake is not needed for the job to be found. A worker
+                // re-checks the injector after announcing sleep and before
+                // parking, so it cannot park while this job is queued; the
+                // worker that displaced it is by definition awake and will
+                // reach the injector itself. Anybody already asleep is asleep
+                // because there was no work, and this one job does not change
+                // that.
+                self.injector.push(displaced);
             } else {
                 self.local[worker].inbox.push(displaced);
             }

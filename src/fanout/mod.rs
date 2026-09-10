@@ -1234,8 +1234,26 @@ impl Pool {
                 None => break,
             }
         }
-        if taken > 1 {
-            self.nudge(None);
+        // **What is left, not what was taken.** This was `taken > 1`, which is
+        // dead code for every flavor that ships: `injector_batch` defaults to
+        // 1, so the loop above can never take more than one and the condition
+        // is never true. A worker that woke, found sixteen jobs queued and took
+        // one told nobody, then looped and took another, and another, draining
+        // the injector before its neighbours had finished waking.
+        //
+        // That concentration is permanent under `local_wakes`, which is the
+        // point: a task's waker sends it back to the worker that last polled
+        // it, so whichever worker grabbed a task at startup owns it for the
+        // whole run. Measured on YCSB C with sixteen client tasks on sixteen
+        // workers: 7.3 cores kept busy against tokio's 13.0, at per-core rates
+        // within 3% of each other, so the entire gap was cores left idle.
+        //
+        // One wake per job still queued, which is the rule `nudge_many`
+        // documents. Bounded by the worker count because there is no point
+        // naming more sleepers than exist.
+        let remaining = self.injector.len();
+        if remaining > 0 {
+            self.nudge_many(None, remaining.min(self.workers()));
         }
         taken
     }
@@ -1427,6 +1445,53 @@ mod wake_distribution {
             pool.sleeping.load(Ordering::SeqCst),
             0,
             "a claimed sleeper must leave the bitmap, or the next submit picks it again"
+        );
+    }
+
+    /// Taking from a queue that still has work must wake somebody.
+    ///
+    /// The condition here was `taken > 1`, which is dead code for every flavor
+    /// that ships: `injector_batch` defaults to 1, so the take loop can never
+    /// take more than one and the nudge never fired. A worker that woke, found
+    /// sixteen jobs queued and took one told nobody, then looped and took
+    /// another, draining the injector before its neighbours finished waking.
+    ///
+    /// Under `local_wakes` that concentration is permanent, because a task's
+    /// waker returns it to the worker that last polled it. YCSB C with sixteen
+    /// client tasks on sixteen workers kept 7.3 cores busy against tokio's
+    /// 13.0, at per-core rates within 3%, so the whole gap was idle cores.
+    /// After this, 12.9.
+    ///
+    /// The assertion is on distinct workers woken rather than on timing.
+    #[test]
+    fn taking_one_job_wakes_someone_for_the_rest() {
+        const WORKERS: usize = 8;
+        const QUEUED: usize = 8;
+
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        // injector_batch 1 is the default and the case that was broken.
+        let pool = Pool::with_tuning(WORKERS, 64, host.clone(), Tuning::locality());
+        assert_eq!(pool.tuning.injector_batch, 1, "the default this guards");
+
+        for _ in 0..QUEUED {
+            pool.injector.push(super::Job::from_boxed(|| {}));
+        }
+        pool.sleeping.store((1usize << WORKERS) - 1, Ordering::SeqCst);
+
+        let mut mine = super::VecDeque::new();
+        let taken = pool.take_from_injector(&mut mine);
+
+        assert_eq!(taken, 1, "one, because that is the batch size");
+        let unparked = host.unparked.lock().expect("the log").clone();
+        let distinct: HashSet<usize> = unparked.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            QUEUED - 1,
+            "{} jobs were left queued and {} workers were woken, {unparked:?}",
+            QUEUED - 1,
+            distinct.len()
         );
     }
 

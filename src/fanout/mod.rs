@@ -808,8 +808,34 @@ impl Pool {
         // caught in a profile with all sixteen workers parked in `__ulock_wait`
         // while the run had work outstanding, at a sixth of normal throughput.
         core::sync::atomic::fence(Ordering::SeqCst);
-        if self.sleeping.load(Ordering::SeqCst) & (1usize << worker) != 0 {
-            self.wake(Some(worker));
+        // **This worker, and no other.** The job above went into this worker's
+        // slot or inbox, and neither is stealable, so waking anybody else
+        // wakes somebody who is not allowed to touch it.
+        //
+        // `wake` cannot be used here. It treats its argument as a fallback and
+        // takes `trailing_zeros()` whenever any worker is asleep, so a private
+        // job handed to worker 7 while worker 0 was also asleep unparked
+        // worker 0, which found nothing it could take and parked again, while
+        // worker 7 slept on work nobody could reach. That is a lost wakeup
+        // even though a wake was sent, and it is the shape that shows up as
+        // one busy core with tasks outstanding.
+        self.wake_specific(worker);
+    }
+
+    /// Wake one named worker, because the work is private to it.
+    ///
+    /// Distinct from [`Pool::wake`], which is free to prefer any sleeper
+    /// because the job it is announcing went to the injector where anyone can
+    /// reach it. The two must not be confused: the difference is whether the
+    /// work is stealable.
+    ///
+    /// The read of the bit is folded into the claim. It is still a `SeqCst`
+    /// read-modify-write, so the Dekker pair the fence above exists for is
+    /// unchanged.
+    fn wake_specific(&self, worker: usize) {
+        let bit = 1usize << worker;
+        if self.sleeping.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+            self.host.unpark(worker);
         }
     }
 
@@ -1401,6 +1427,41 @@ mod wake_distribution {
             pool.sleeping.load(Ordering::SeqCst),
             0,
             "a claimed sleeper must leave the bitmap, or the next submit picks it again"
+        );
+    }
+
+    /// Private work must wake the worker that holds it, not any sleeper.
+    ///
+    /// `submit_local` puts the job in one worker's slot or inbox, and neither
+    /// is stealable. It then called `wake(Some(worker))`, but `wake` treats its
+    /// argument as a fallback and prefers `trailing_zeros()` whenever anybody
+    /// is asleep. So a job handed to worker 5 while worker 0 was also asleep
+    /// unparked worker 0, which found nothing it was allowed to take and
+    /// parked again, while worker 5 slept on the job.
+    ///
+    /// A wake was sent every time, which is why this survived a hunt for a
+    /// lost wakeup and an added `SeqCst` fence. It went to the wrong worker.
+    #[test]
+    fn private_work_wakes_the_worker_that_holds_it() {
+        const WORKERS: usize = 8;
+        // Deliberately not worker 0: the bug is invisible when the worker that
+        // holds the job is also the lowest-numbered sleeper, which is exactly
+        // how a two-worker test would miss it.
+        const HOLDER: usize = 5;
+
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(WORKERS, 64, host.clone(), Tuning::locality());
+        pool.sleeping.store((1usize << WORKERS) - 1, Ordering::SeqCst);
+
+        pool.submit_local(HOLDER, super::Job::from_boxed(|| {}));
+
+        let unparked = host.unparked.lock().expect("the log").clone();
+        assert_eq!(
+            unparked,
+            alloc::vec![HOLDER],
+            "a job private to worker {HOLDER} woke {unparked:?}; only {HOLDER} can run it"
         );
     }
 

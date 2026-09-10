@@ -104,6 +104,33 @@ pub struct Tuning {
     /// contention-free work; too large and one worker holds a backlog its
     /// neighbours cannot see until the next heartbeat.
     pub injector_batch: usize,
+    /// Where a job displaced from the LIFO slot goes.
+    ///
+    /// `false`, the default, sends it to a private inbox behind the slot: one
+    /// swap and a `SegQueue` push, reachable by nobody until this worker
+    /// drains it. `true` sends it to the injector, where any worker can take
+    /// it, at the cost of a wake.
+    ///
+    /// **This is the difference between two failure modes, and both are real.**
+    ///
+    /// Private: a worker that accumulates several self-waking tasks keeps all
+    /// of them. The inbox drains into the private deque, the deque is shared
+    /// only on a heartbeat counted in `mine.pop_back` calls, and the LIFO slot
+    /// ahead of that in the loop starves the heartbeat for as long as any task
+    /// keeps waking itself. Measured on sixteen workers with eight self-waking
+    /// read-only tasks: four runs in eight collapsed to a single active worker
+    /// with the other fifteen parked, at exactly the one-thread rate. Every
+    /// wake was delivered. The work became invisible, which is why this looks
+    /// like a lost wakeup and is not one.
+    ///
+    /// Shared: every displacement is an injector push and a wake. On work that
+    /// is *lock*-bound rather than CPU-bound there is no parallelism to win and
+    /// the churn is pure cost. Measured on a 50% update workload: throughput
+    /// fell from 943,606 to 651,554 while cores busy went from 1.13 to 13.16.
+    ///
+    /// So it is a policy, not a fix. Read-mostly work with independent tasks
+    /// wants `true`; work that contends on row locks wants `false`.
+    pub share_displaced: bool,
     /// Whether [`Pool::submit_local`] keeps work on the calling worker.
     ///
     /// `false` makes it forward to [`Pool::submit_job`], which is the whole of
@@ -164,6 +191,7 @@ impl Tuning {
     #[must_use]
     pub fn locality() -> Self {
         Self {
+            share_displaced: false,
             rounds_before_park: ROUNDS_BEFORE_PARK,
             backoff_spins: BACKOFF_SPINS,
             promote_every: PROMOTE_EVERY,
@@ -210,6 +238,13 @@ impl Tuning {
             injector_batch: 8,
             ..Self::locality()
         }
+    }
+
+    /// Set [`share_displaced`](Self::share_displaced).
+    #[must_use]
+    pub fn with_share_displaced(mut self, share: bool) -> Self {
+        self.share_displaced = share;
+        self
     }
 
     /// Set [`rounds_before_park`](Self::rounds_before_park).
@@ -660,11 +695,38 @@ impl Pool {
             self.push(None, job);
             return;
         }
-        // The slot first, and whatever it held goes to the inbox behind it.
-        // One swap on the common path, against a `SegQueue` push and pop.
+        // The slot first, and whatever it held goes wherever
+        // `Tuning::share_displaced` says.
+        //
+        // # At most one task may be private to a worker, under `share_displaced`
+        //
+        // The slot is not stealable, which is the point: the task that just
+        // woke itself runs next, on the worker whose cache lines it is still
+        // in. That is worth having for one task and is a trap for two.
+        //
+        // A displaced job used to go to a private inbox behind the slot. Both
+        // are unreachable by any other worker, so a worker that accumulated
+        // several distinct tasks kept them, and nothing could take them back:
+        // the inbox drains into the private deque, the deque is shared only on
+        // a heartbeat counted in `mine.pop_back` calls, and the LIFO slot ahead
+        // of that in the loop starves the heartbeat for as long as any task
+        // keeps waking itself. Every wake was delivered; the work simply became
+        // invisible, which is why the `SeqCst` Dekker pair below did not fix
+        // it and why it looked like a lost wakeup.
+        //
+        // Measured on sixteen workers with eight self-waking client tasks,
+        // YCSB C: four runs in eight collapsed to one active worker with the
+        // other fifteen parked in `__ulock_wait`, at exactly the one-thread
+        // rate. Sending the displaced job to the injector keeps the locality
+        // win, which is entirely about the *first* task, and makes the second
+        // one somebody else's to take.
         let displaced = self.local[worker].lifo.lock().replace(job);
         if let Some(displaced) = displaced {
-            self.local[worker].inbox.push(displaced);
+            if self.tuning.share_displaced {
+                self.push(Some(worker), displaced);
+            } else {
+                self.local[worker].inbox.push(displaced);
+            }
         }
         // Publish, then read the bitmap, with a barrier between.
         //
@@ -716,15 +778,34 @@ impl Pool {
     /// Used when work becomes *stealable* rather than newly submitted: a batch
     /// pulled off the injector, or a private queue shared on the heartbeat.
     fn nudge(&self, except: Option<usize>) {
+        self.nudge_many(except, 1);
+    }
+
+    /// Wake up to `wanted` sleepers, other than `except`.
+    ///
+    /// **One wake per job made available, not one per sharing event.** A
+    /// worker that shares eight jobs and wakes one sleeper has published work
+    /// seven other parked workers cannot see: the woken one takes what it
+    /// needs, and nothing else generates a wake, because a task that self-wakes
+    /// stays local by design and never touches the injector again.
+    ///
+    /// That is not a lost wakeup, which is why the `SeqCst` Dekker pair did not
+    /// fix it. Every wake that was sent arrived. There were simply too few of
+    /// them, and the pool has no timeout that would notice.
+    fn nudge_many(&self, except: Option<usize>, wanted: usize) {
         let spare = match except {
             Some(id) => 1usize << id,
             None => 0,
         };
-        let sleeping = self.sleeping.load(Ordering::SeqCst) & !spare;
-        if sleeping != 0 {
+        let mut sleeping = self.sleeping.load(Ordering::SeqCst) & !spare;
+        for _ in 0..wanted {
+            if sleeping == 0 {
+                return;
+            }
             #[allow(clippy::cast_possible_truncation)]
             let candidate = sleeping.trailing_zeros() as usize;
             self.host.unpark(candidate);
+            sleeping &= !(1usize << candidate);
         }
     }
 
@@ -1080,7 +1161,10 @@ impl Pool {
             }
         }
         if shared > 0 {
-            self.nudge(Some(id));
+            // One wake per job published. Waking a single worker for a batch
+            // leaves the rest of the batch reachable in principle and unseen
+            // in practice.
+            self.nudge_many(Some(id), shared);
         }
     }
 

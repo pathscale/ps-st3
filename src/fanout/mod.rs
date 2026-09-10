@@ -256,7 +256,8 @@ impl Tuning {
         }
     }
 
-    /// Set [`lifo_run_limit`](Self::lifo_run_limit).
+    /// Set [`lifo_run_limit`](Self::lifo_run_limit). Must be nonzero;
+    /// pool construction rejects zero because it would never consume the slot.
     #[must_use]
     pub fn with_lifo_run_limit(mut self, limit: u32) -> Self {
         self.lifo_run_limit = limit;
@@ -584,6 +585,10 @@ impl Pool {
     ) -> Arc<Self> {
         assert!(workers > 0, "a pool needs at least one worker");
         assert!(
+            tuning.lifo_run_limit > 0,
+            "`lifo_run_limit` must be nonzero"
+        );
+        assert!(
             tuning.promote_every > 0,
             "`promote_every` is a countdown to zero: 0 never reaches it"
         );
@@ -777,20 +782,26 @@ impl Pool {
             // read-only work with many independent tasks. Which of those a
             // table does is exactly what a flavor is for.
             if self.tuning.share_displaced && !self.local[worker].inbox.is_empty() {
-                // **Published, not announced.** `push` would also unpark a
-                // sleeper, and that wake is what made this expensive on
-                // lock-bound work: the woken worker steals the job, runs it,
-                // blocks on the same row lock, and parks again, so the pool
-                // pays a park/unpark round trip per displacement for work that
-                // was serialised anyway.
+                // **Published, not announced.**
                 //
-                // The wake is not needed for the job to be found. A worker
-                // re-checks the injector after announcing sleep and before
-                // parking, so it cannot park while this job is queued; the
-                // worker that displaced it is by definition awake and will
-                // reach the injector itself. Anybody already asleep is asleep
-                // because there was no work, and this one job does not change
-                // that.
+                // `push` plus a wake is what made this expensive on lock-bound
+                // work: the woken worker steals the job, runs it, blocks on the
+                // same row lock and parks again, so the pool pays a park/unpark
+                // round trip per displacement for work that was serialised
+                // anyway.
+                //
+                // The review's objection to that was starvation: an owner
+                // servicing self-wakes forever leaves this job behind while
+                // peers sleep. Real, and fixed below at the LIFO fairness
+                // boundary, where the owner services the injector itself. That
+                // path ends in `take_from_injector`, which already wakes one
+                // sleeper per job still queued. So the sleepers are told; they
+                // are told once per fairness boundary instead of once per
+                // displacement, which is the same news for a fraction of the
+                // round trips.
+                //
+                // A wake here would be the third mechanism for one job, and the
+                // one measured to cost the most.
                 self.injector.push(displaced);
             } else {
                 self.local[worker].inbox.push(displaced);
@@ -829,11 +840,14 @@ impl Pool {
     /// reach it. The two must not be confused: the difference is whether the
     /// work is stealable.
     ///
-    /// The read of the bit is folded into the claim. It is still a `SeqCst`
-    /// read-modify-write, so the Dekker pair the fence above exists for is
-    /// unchanged.
+    /// Avoid modifying the shared bitmap for an already-awake owner. The
+    /// preceding publication fence and this SeqCst load retain the sleep
+    /// handshake; only an observed sleeper requires a modifying claim.
     fn wake_specific(&self, worker: usize) {
         let bit = 1usize << worker;
+        if self.sleeping.load(Ordering::SeqCst) & bit == 0 {
+            return;
+        }
         if self.sleeping.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
             self.host.unpark(worker);
         }
@@ -888,8 +902,9 @@ impl Pool {
             None => 0,
         };
         for _ in 0..wanted {
-            let Some(candidate) = self.claim_sleeper(spare) else {
-                return;
+            let candidate = match self.claim_sleeper(spare) {
+                Some(candidate) => candidate,
+                None => return,
             };
             self.host.unpark(candidate);
         }
@@ -1026,6 +1041,12 @@ impl Pool {
                 job.run();
                 self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
                 continue;
+            }
+            // Sharing must still make progress with one worker, or when all
+            // peers are busy. Service the injector at the local fairness
+            // boundary so displaced work cannot wait forever behind self-wakes.
+            if lifo_run == lifo_run_limit && self.tuning.share_displaced {
+                self.take_from_injector(&mut mine);
             }
             lifo_run = 0;
 
@@ -1391,10 +1412,104 @@ mod wake_distribution {
         unparked: Mutex<Vec<usize>>,
     }
 
+    /// Displacement publishes to the injector without waking anybody.
+    ///
+    /// The wake is deliberately absent. It costs a park/unpark round trip per
+    /// displacement on lock-bound work, where the woken worker steals the job,
+    /// blocks on the same lock and parks again. The sleepers are reached from
+    /// `take_from_injector` instead, which the owner reaches at the LIFO
+    /// fairness boundary and which wakes one per job still queued.
+    ///
+    /// This asserts the absence, because the absence is the decision. A patch
+    /// that adds the wake back should fail here and argue with the comment
+    /// rather than land quietly.
+    #[test]
+    fn displacement_publishes_without_paying_for_a_wake() {
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(
+            2,
+            64,
+            host.clone(),
+            Tuning::locality().with_share_displaced(true),
+        );
+        pool.sleeping.store(1 << 1, Ordering::SeqCst);
+        pool.submit_local(0, super::Job::from_boxed(|| {}));
+        pool.submit_local(0, super::Job::from_boxed(|| {}));
+        assert!(host.unparked.lock().unwrap().is_empty());
+        pool.submit_local(0, super::Job::from_boxed(|| {}));
+        assert_eq!(pool.injector.len(), 1, "the third displacement is public");
+        assert!(
+            host.unparked.lock().unwrap().is_empty(),
+            "publishing a displaced job must not cost a wake"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "lifo_run_limit")]
+    fn zero_lifo_budget_is_rejected_before_work_can_be_stranded() {
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let _ = Pool::with_tuning(1, 64, host, Tuning::locality().with_lifo_run_limit(0));
+    }
+
+    #[test]
+    fn one_worker_services_displaced_work_before_local_retry_exhaustion() {
+        use alloc::sync::Weak;
+        use core::sync::atomic::{AtomicBool, AtomicUsize};
+        fn retry(pool: Weak<Pool>, done: Arc<AtomicBool>, polls: Arc<AtomicUsize>) -> super::Job {
+            super::Job::from_boxed(move || {
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                // A finite sentinel makes a broken scheduler fail an assertion,
+                // rather than making the test itself wait forever.
+                if polls.fetch_add(1, Ordering::Relaxed) < 512 {
+                    let owner = pool.upgrade().unwrap();
+                    owner.submit_local(0, retry(pool, done, polls));
+                }
+            })
+        }
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(
+            1,
+            64,
+            host,
+            Tuning::locality()
+                .with_share_displaced(true)
+                .with_lifo_run_limit(4),
+        );
+        let done = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        pool.submit_local(0, retry(Arc::downgrade(&pool), done.clone(), polls.clone()));
+        let (owner, completed) = (Arc::downgrade(&pool), done.clone());
+        pool.submit_local(
+            0,
+            super::Job::from_boxed(move || {
+                completed.store(true, Ordering::Release);
+                owner.upgrade().unwrap().shut_down();
+            }),
+        );
+        pool.submit_local(0, retry(Arc::downgrade(&pool), done.clone(), polls.clone()));
+        assert!(pool.run(pool.runner(0)));
+        assert!(done.load(Ordering::Acquire));
+        assert!(
+            polls.load(Ordering::Relaxed) < 512,
+            "public work starved behind private retries"
+        );
+    }
+
     impl Host for RecordingHost {
         fn park(&self, _worker: usize) {}
         fn unpark(&self, worker: usize) {
-            self.unparked.lock().expect("no state a panic could corrupt").push(worker);
+            self.unparked
+                .lock()
+                .expect("no state a panic could corrupt")
+                .push(worker);
         }
         fn now_ns(&self) -> u64 {
             0
@@ -1426,7 +1541,8 @@ mod wake_distribution {
 
         // Everyone is asleep, which is the state a pool sits in between bursts
         // of work and the state this used to collapse from.
-        pool.sleeping.store((1usize << WORKERS) - 1, Ordering::SeqCst);
+        pool.sleeping
+            .store((1usize << WORKERS) - 1, Ordering::SeqCst);
 
         for _ in 0..WORKERS {
             pool.wake(None);
@@ -1478,7 +1594,8 @@ mod wake_distribution {
         for _ in 0..QUEUED {
             pool.injector.push(super::Job::from_boxed(|| {}));
         }
-        pool.sleeping.store((1usize << WORKERS) - 1, Ordering::SeqCst);
+        pool.sleeping
+            .store((1usize << WORKERS) - 1, Ordering::SeqCst);
 
         let mut mine = super::VecDeque::new();
         let taken = pool.take_from_injector(&mut mine);
@@ -1518,7 +1635,8 @@ mod wake_distribution {
             unparked: Mutex::new(Vec::new()),
         });
         let pool = Pool::with_tuning(WORKERS, 64, host.clone(), Tuning::locality());
-        pool.sleeping.store((1usize << WORKERS) - 1, Ordering::SeqCst);
+        pool.sleeping
+            .store((1usize << WORKERS) - 1, Ordering::SeqCst);
 
         pool.submit_local(HOLDER, super::Job::from_boxed(|| {}));
 
@@ -1542,7 +1660,8 @@ mod wake_distribution {
             unparked: Mutex::new(Vec::new()),
         });
         let pool = Pool::with_tuning(WORKERS, 64, host.clone(), Tuning::default());
-        pool.sleeping.store((1usize << WORKERS) - 1, Ordering::SeqCst);
+        pool.sleeping
+            .store((1usize << WORKERS) - 1, Ordering::SeqCst);
 
         pool.nudge_many(None, 3);
         pool.nudge_many(None, 3);

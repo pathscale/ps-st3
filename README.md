@@ -39,14 +39,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ps-st3 = "0.5.0"
+ps-st3 = "0.6.2"
 ```
 
 For the queues alone, without the pool below and without its one dependency:
 
 ```toml
 [dependencies]
-ps-st3 = { version = "0.5.0", default-features = false }
+ps-st3 = { version = "0.6.2", default-features = false }
 ```
 
 

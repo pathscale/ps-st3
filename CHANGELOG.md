@@ -1,3 +1,13 @@
+# 0.6.2 (2026-09-12)
+
+### Fixed
+
+- After reaching its LIFO fairness quota, a worker still probes other queues
+  first, then resumes ready local work without an idle backoff. Previously
+  self-waking tasks paid an unnecessary delay at every quota boundary.
+- A deterministic regression test checks that a continuously ready local chain
+  performs zero idle backoffs; displaced-work fairness remains covered.
+
 # 0.6.0 (2026-09-10)
 
 ### Added

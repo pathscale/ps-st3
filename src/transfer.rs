@@ -170,8 +170,8 @@ mod tests {
                     for dst_pos in 0..(dst_cap as UnsignedShort * 2) {
                         for count in 0..=(src_cap.min(dst_cap) as UnsignedShort) {
                             let src = buffer(src_cap);
-                            for i in 0..src_cap {
-                                src[i].with_mut(|s| unsafe {
+                            for (i, slot) in src.iter().enumerate() {
+                                slot.with_mut(|s| unsafe {
                                     s.write(MaybeUninit::new(0xC0DE_0000u32 + i as u32))
                                 });
                             }

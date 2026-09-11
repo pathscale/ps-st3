@@ -257,5 +257,11 @@ parking timeout. Your embedding owns worker creation and shutdown. The `host`
 feature adds `StdHost` with an `Instant` clock over this same implementation.
 
 `Tuning::with_stealable_inbox(true)` lets idle peers take displaced local jobs
-while retaining a private warm LIFO slot. It is a Rust callsite option, useful
+while retaining a warm LIFO slot between fairness boundaries. At the LIFO quota,
+the slot job also enters the stealable inbox, including a lone self-waking task.
+It is a Rust callsite option, useful
 for independent tasks; measure its extra sharing cost on lock handoffs.
+
+The opt-in presets are `Tuning::almost_tokio()` (a three-poll LIFO quota and
+shared FIFO inbox) and `Tuning::parking()` (the same policy with no idle spin
+rounds). These are Nagoya scheduler policies, not a Tokio compatibility mode.

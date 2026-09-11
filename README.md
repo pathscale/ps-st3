@@ -262,9 +262,11 @@ the slot job also enters the stealable inbox, including a lone self-waking task.
 It is a Rust callsite option, useful
 for independent tasks; measure its extra sharing cost on lock handoffs.
 
-The opt-in presets are `Tuning::almost_tokio()` (a three-poll LIFO quota and
-shared FIFO inbox) and `Tuning::parking()` (the same policy with no idle spin
-rounds). These are Nagoya scheduler policies, not a Tokio compatibility mode.
+The opt-in preset `Tuning::almost_tokio()` combines a three-poll LIFO quota,
+a shared FIFO inbox and host parking without idle spin rounds. It is a Nagoya
+scheduler policy, not a Tokio compatibility mode. Dated benchmark reports
+called this policy `parking`; the earlier aggressive-spin `almost_tokio`
+preset was retired before release.
 
 The default locality policy uses four empty search rounds and 128 spin hints
 per round before host parking. Keep CPU use between bursts alongside throughput

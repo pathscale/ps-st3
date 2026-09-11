@@ -247,3 +247,15 @@ terms, which are explicitly outlined within those assets.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
+
+## Blocking without Rust std
+
+Enable `atomic-host` with `default-features = false` for `fanout::AtomicHost`.
+Pass the worker count and a `fn() -> u64` monotonic nanosecond clock. The host
+uses atomic-wait platform calls, retains wake permits, and has no periodic
+parking timeout. Your embedding owns worker creation and shutdown. The `host`
+feature adds `StdHost` with an `Instant` clock over this same implementation.
+
+`Tuning::with_stealable_inbox(true)` lets idle peers take displaced local jobs
+while retaining a private warm LIFO slot. It is a Rust callsite option, useful
+for independent tasks; measure its extra sharing cost on lock handoffs.

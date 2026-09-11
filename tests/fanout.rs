@@ -397,3 +397,62 @@ fn short_jobs_do_not_wait_behind_a_long_one() {
     );
     let _ = finished;
 }
+
+/// A blocked owner keeps only its warm slot; peers can drain every displaced job.
+#[test]
+fn stealable_inbox_drains_behind_a_blocked_owner_exactly_once() {
+    use st3::fanout::{Job, Tuning};
+    use std::sync::mpsc;
+    let pool = Pool::with_tuning(
+        4,
+        64,
+        Arc::new(StdHost::new(4)),
+        Tuning::locality()
+            .with_stealable_inbox(true)
+            .with_rounds_before_park(0),
+    );
+    let (entered, ready) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    pool.submit_local(
+        0,
+        Job::from_boxed(move || {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(10)).unwrap();
+        }),
+    );
+    let threads: Vec<_> = (0..4)
+        .map(|id| {
+            let pool = pool.clone();
+            std::thread::spawn(move || assert!(pool.run(pool.runner(id))))
+        })
+        .collect();
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let counts: Arc<Vec<AtomicUsize>> = Arc::new((0..2000).map(|_| AtomicUsize::new(0)).collect());
+    let (finished, completed) = mpsc::channel();
+    for id in 0..counts.len() {
+        let counts = counts.clone();
+        let finished = finished.clone();
+        pool.submit_local(
+            0,
+            Job::from_boxed(move || {
+                counts[id].fetch_add(1, Ordering::Relaxed);
+                finished.send(()).unwrap();
+            }),
+        );
+    }
+    // All but the warm slot must run before the blocked owner is released.
+    for _ in 0..counts.len() - 1 {
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("displaced work was stranded");
+    }
+    release.send(()).unwrap();
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    pool.shut_down();
+    for worker in threads {
+        worker.join().unwrap();
+    }
+    assert!(counts
+        .iter()
+        .all(|count| count.load(Ordering::Relaxed) == 1));
+}

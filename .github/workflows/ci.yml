@@ -30,6 +30,10 @@ jobs:
       - name: Run cargo check
         run: cargo check
 
+      - name: Check OS parking without Rust std
+        if: matrix.rust == 'stable'
+        run: cargo check --no-default-features --features atomic-host
+
   test:
     name: Test suite
     runs-on: ubicloud-standard-2
@@ -48,6 +52,9 @@ jobs:
       # This is also what builds the floor example, under -Dwarnings.
       - name: Run cargo test (fanout with a std host)
         run: cargo test --release --features host
+
+      - name: Test atomic parking without the std host
+        run: cargo test --release --no-default-features --features atomic-host --test atomic-host
 
   loom:
     name: Test suite (Loom)

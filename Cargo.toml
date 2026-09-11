@@ -61,7 +61,12 @@ fanout = ["dep:spin", "dep:crossbeam-queue"]
 # which on Linux, Android and FreeBSD depends on `libc`, and `libc` 0.2.189
 # requires **1.65**. macOS and Windows do not pull it. CI checks 1.60 without
 # this feature for that reason.
-host = ["fanout", "dep:atomic-wait"]
+host = ["atomic-host"]
+
+# OS blocking waits without Rust std. The caller supplies a monotonic clock
+# and worker lifecycle. Like `host`, supported platforms come from atomic-wait
+# and its libc dependency can require a newer compiler than the portable core.
+atomic-host = ["fanout", "dep:atomic-wait"]
 
 [dev-dependencies]
 criterion = "0.3"
@@ -90,6 +95,11 @@ path = "tests/tests.rs"
 name = "fanout"
 path = "tests/fanout.rs"
 required-features = ["host"]
+
+[[test]]
+name = "atomic-host"
+path = "tests/atomic_host.rs"
+required-features = ["atomic-host"]
 
 [[example]]
 name = "floor"

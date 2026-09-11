@@ -945,7 +945,7 @@ impl Pool {
             // boundary so displaced work cannot wait forever behind self-wakes.
             let slot_budget_exhausted = lifo_run == lifo_run_limit;
             if slot_budget_exhausted && self.tuning.stealable_inbox {
-                self.publish_capped_slot(w.id);
+                self.publish_capped_slot(w.id, !mine.is_empty() || !queue.is_empty());
             }
             if slot_budget_exhausted && self.tuning.share_displaced {
                 self.take_from_injector(&mut mine);
@@ -1195,14 +1195,17 @@ impl Pool {
         taken
     }
 
-    /// A capped warm task becomes available to peers at the fairness boundary.
-    /// An idle peer may take it; otherwise its owner consumes the FIFO inbox.
-    fn publish_capped_slot(&self, id: usize) {
+    /// Expose a capped task without waking a peer merely to move the only job.
+    /// The active owner consumes a lone inbox entry on its next step. If it has
+    /// other work, announce the extra capacity a peer can use.
+    fn publish_capped_slot(&self, id: usize, has_other_ready_work: bool) {
         let job = self.local[id].lifo.lock().take();
         if let Some(job) = job {
             self.local[id].inbox.push(job);
             core::sync::atomic::fence(Ordering::SeqCst);
-            self.nudge(Some(id));
+            if has_other_ready_work || self.local[id].inbox.len() > 1 {
+                self.nudge(Some(id));
+            }
         }
     }
 
@@ -1466,12 +1469,35 @@ mod wake_distribution {
         pool.sleeping.store(1 << 1, Ordering::SeqCst);
         pool.submit_local(0, super::Job::from_boxed(|| {}));
         assert_eq!(pool.steal_once(&thief, 1, &mut 123), 0);
-        pool.publish_capped_slot(0);
-        assert_eq!(*host.unparked.lock().unwrap(), [1]);
+        pool.publish_capped_slot(0, false);
+        assert!(host.unparked.lock().unwrap().is_empty());
         assert_eq!(pool.steal_once(&thief, 1, &mut 456), 1);
         assert!(thief.pop().is_some());
         assert!(pool.local[0].lifo.lock().is_none());
         assert!(pool.local[0].inbox.is_empty());
+    }
+
+    #[test]
+    fn a_capped_task_announces_spare_work_when_its_owner_has_other_jobs() {
+        for private_backlog in [false, true] {
+            let host = Arc::new(RecordingHost {
+                unparked: Mutex::new(Vec::new()),
+            });
+            let pool = Pool::with_tuning(2, 64, host.clone(), Tuning::almost_tokio());
+            pool.submit_local(0, super::Job::from_boxed(|| {}));
+            if !private_backlog {
+                // A second task displaces the first into the shared inbox.
+                pool.submit_local(0, super::Job::from_boxed(|| {}));
+            }
+            pool.sleeping.store(1 << 1, Ordering::SeqCst);
+            host.unparked.lock().unwrap().clear();
+            pool.publish_capped_slot(0, private_backlog);
+            assert_eq!(*host.unparked.lock().unwrap(), [1]);
+            assert!(pool.local[0].lifo.lock().is_none());
+            let thief = pool.local[1].queue.lock().take().unwrap();
+            assert_eq!(pool.steal_once(&thief, 1, &mut 456), 1);
+            assert!(thief.pop().is_some());
+        }
     }
 
     /// Displacement publishes to the injector without waking anybody.

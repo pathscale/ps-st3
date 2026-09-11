@@ -539,6 +539,8 @@ pub struct Pool {
     /// on both sides. Too few searchers and work sits in a deque with nobody
     /// coming for it; too many and they cost more than they redistribute.
     searching: AtomicUsize,
+    #[cfg(test)]
+    idle_backoffs: AtomicUsize,
 }
 
 impl Pool {
@@ -624,6 +626,8 @@ impl Pool {
             tuning,
             sleeping: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
+            #[cfg(test)]
+            idle_backoffs: AtomicUsize::new(0),
         })
     }
 
@@ -1045,7 +1049,8 @@ impl Pool {
             // Sharing must still make progress with one worker, or when all
             // peers are busy. Service the injector at the local fairness
             // boundary so displaced work cannot wait forever behind self-wakes.
-            if lifo_run == lifo_run_limit && self.tuning.share_displaced {
+            let slot_budget_exhausted = lifo_run == lifo_run_limit;
+            if slot_budget_exhausted && self.tuning.share_displaced {
                 self.take_from_injector(&mut mine);
             }
             lifo_run = 0;
@@ -1158,6 +1163,23 @@ impl Pool {
                 continue;
             }
 
+            // The fairness boundary skips the local slot to give other work a
+            // chance. If those probes found nothing, the slot is still ready
+            // work: run it instead of paying an idle backoff. Release its lock
+            // before running, since this job may wake itself into the slot.
+            let ready_slot = if slot_budget_exhausted {
+                self.local[w.id].lifo.lock().take()
+            } else {
+                None
+            };
+            if let Some(job) = ready_slot {
+                lifo_run = 1;
+                spins = 0;
+                job.run();
+                self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
             // Nothing found this round, and nothing left to run. Shutdown is
             // checked **here**, not only on the park path below: a worker with
             // a large `rounds_before_park` would otherwise spin out its whole
@@ -1173,6 +1195,8 @@ impl Pool {
             // `Tuning::rounds_before_park` for why the wake, not the park,
             // costs.
             if spins < self.tuning.rounds_before_park {
+                #[cfg(test)]
+                self.idle_backoffs.fetch_add(1, Ordering::Relaxed);
                 spins += 1;
                 // Back off *without* touching anything shared. Looking again
                 // means a pop off the injector and a probe of every other
@@ -1410,6 +1434,39 @@ mod wake_distribution {
     /// has to remember the names.
     struct RecordingHost {
         unparked: Mutex<Vec<usize>>,
+    }
+
+    #[test]
+    fn fairness_probe_does_not_back_off_with_ready_local_work() {
+        fn chain(pool: Arc<Pool>, remaining: usize) -> super::Job {
+            super::Job::from_boxed(move || {
+                if remaining == 0 {
+                    pool.shut_down();
+                } else {
+                    pool.submit_local(0, chain(pool.clone(), remaining - 1));
+                }
+            })
+        }
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(
+            1,
+            64,
+            host,
+            Tuning::locality()
+                .with_lifo_run_limit(1)
+                .with_rounds_before_park(16)
+                .with_backoff_spins(1),
+        );
+        pool.submit_local(0, chain(pool.clone(), 8));
+        assert!(pool.run(pool.runner(0)));
+        assert_eq!(pool.completed(0), 9);
+        assert_eq!(
+            pool.idle_backoffs.load(Ordering::Relaxed),
+            0,
+            "a fairness probe may check other queues, but ready work is not idle"
+        );
     }
 
     /// Displacement publishes to the injector without waking anybody.

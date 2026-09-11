@@ -140,32 +140,11 @@ pub struct Tuning {
     /// `share_displaced` and wakes a peer when displaced work is published.
     /// It trades lock-handoff locality for prompt access to independent work.
     pub stealable_inbox: bool,
-    /// Whether [`Pool::submit_local`] keeps work on the calling worker.
+    /// Whether local wakes retain the calling worker's locality.
     ///
-    /// `false` makes it forward to [`Pool::submit_job`], which is the whole of
-    /// the switch. It is a parameter because the right answer depends on the
-    /// workload and the two answers are far apart. Measured at eight threads
-    /// against a tokio-driven build of the same storage engine:
-    ///
-    /// ```text
-    /// workload                       local     injector
-    /// 50% update                      +6.4%      -40.2%
-    /// read-modify-write               +2.0%      -38.4%
-    /// 95% read / 5% update           -19.2%      +74.4%
-    /// 95% read / 5% insert          +137.1%     +321.6%
-    /// ```
-    ///
-    /// Contended work wants the handoff kept warm: its wakes are a chain, and
-    /// the successor wants the rows the releasing worker just touched. Sparse
-    /// work wants the opposite, because a rare wake queued behind a busy worker
-    /// waits while others sleep.
-    ///
-    /// `true` is the default because it is the better worst case: one workload
-    /// 19% behind, against two at about 40% behind the other way. There is no
-    /// static rule that gets both, and several were tried: gating on whether
-    /// the wake was a task waking *itself*, on whether any worker was idle, and
-    /// letting a thief take the slot on second sight. Each reproduced one
-    /// column or the other exactly.
+    /// False routes every wake through the shared injector. Local handoffs
+    /// generally favor contended tasks; independent tasks may benefit from
+    /// sharing. Compare throughput, tail latency and CPU on the same workload.
     pub local_wakes: bool,
 
     /// How many jobs a worker runs between two looks at whether anyone needs
@@ -185,18 +164,11 @@ impl Default for Tuning {
 }
 
 impl Tuning {
-    /// Keep a woken task on the worker that woke it.
+    /// Keep local wake handoffs warm, with a short idle retry budget.
     ///
-    /// For work whose wakes are a **chain**: a task releases something and the
-    /// task it releases wants the lines the first one just touched. Update-heavy
-    /// storage paths look like this, and so does anything with a lock handoff.
-    ///
-    /// Measured on YCSB at eight threads against a tokio-driven build of the
-    /// same storage engine: 50% update +6.4%, read-modify-write +2.0%, where
-    /// [`Tuning::spread`] puts both about 40% behind.
-    ///
-    /// This is [`Tuning::default`], because being 19% behind on one shape beats
-    /// being 40% behind on two.
+    /// This is the default: four empty rounds, 128 spin hints per round,
+    /// then host parking. The release comparison favors this balance across
+    /// table operations and sparse bursts; it is not fastest in every cell.
     #[must_use]
     pub fn locality() -> Self {
         Self {
@@ -214,7 +186,7 @@ impl Tuning {
     /// Keep a warm LIFO slot for three polls, then expose its task to peers.
     ///
     /// Displaced work enters a stealable FIFO inbox. This is a Nagoya policy
-    /// inspired by Tokios local scheduling, not a Tokio implementation or
+    /// inspired by local scheduling in Tokio, not a Tokio implementation or
     /// compatibility mode. Measure its sharing cost on contended workloads.
     #[must_use]
     pub fn almost_tokio() -> Self {
@@ -234,17 +206,9 @@ impl Tuning {
 
     /// Send every wake to the injector, where any worker can take it.
     ///
-    /// For work whose wakes are **independent**: the woken task has no claim on
-    /// the waking worker's cache and would rather run now, somewhere else, than
-    /// wait behind it. Read-mostly and insert-mostly paths look like this.
-    ///
-    /// Measured on the same YCSB runs: 95% read / 5% update +74.4%, 95% read /
-    /// 5% insert +321.6%, where [`Tuning::locality`] is 19% behind on the first
-    /// and less than half as fast on the second.
-    ///
-    /// The cost is the other column: update-heavy work goes about 40% behind.
-    /// There is no setting that wins both, which is why this is a choice and
-    /// not a default.
+    /// Independent tasks may benefit from immediate sharing. Contended tasks
+    /// may instead pay for extra migration and wakeups. Uses the same short
+    /// idle budget as locality.
     #[must_use]
     pub fn spread() -> Self {
         Self {
@@ -338,46 +302,14 @@ impl Tuning {
 /// at its own queue.
 const LIFO_RUN_LIMIT: u32 = 32;
 
-/// Empty rounds a worker takes before it announces sleep.
-///
-/// Parking is not expensive to the parker; it is expensive to whoever has to
-/// wake it, because a wake is a mutex and a condvar notify. A worker that
-/// parks the moment its queue runs dry makes every later submit pay one, and
-/// at eight workers that was 0.95 parks a task: the producer became the
-/// bottleneck, and the starvation that caused made the workers park again.
-///
-/// A steady stream refills within a few hundred cycles, so looking again a few
-/// times skips the protocol entirely. Swept at 16, 64, 256 and 1024 empty
-/// rounds over 100,000 tasks and 8 workers: 445, 353, 372 and 365 ns a task.
-/// Past a few dozen it stops mattering.
-const ROUNDS_BEFORE_PARK: u32 = 64;
+/// Empty search rounds before announcing sleep. The release baseline keeps
+/// a small retry budget, then lets the host block instead of burning CPU
+/// between sparse bursts.
+const ROUNDS_BEFORE_PARK: u32 = 4;
 
-/// How long to wait between two empty rounds.
-///
-/// **This is worth more than anything else in this pool.** A worker that finds
-/// nothing looks again, and looking means a pop off the injector and a probe of
-/// every other worker's deque. Eight idle workers doing that in a tight loop
-/// take the very lines the producer is trying to fill, so the pool starves
-/// itself: the same 100,000 tasks that one worker finishes in 12.4 ms took
-/// eight workers 49.2 ms.
-///
-/// Swept over 100,000 tasks on 8 workers, with wake latency measured separately
-/// on an idle pool over 2,000 samples:
-///
-/// ```text
-/// spins     wall      cpu    latency median   p99
-///    64   49.2 ms   440 ms         3917 ns   10333 ns
-///   256   36.0 ms   325 ms         2500 ns    7958 ns
-///  1024   30.3 ms   277 ms         2375 ns    6000 ns
-///  4096   24.4 ms   237 ms         3375 ns   14209 ns
-/// 16384   15.6 ms   213 ms        21000 ns   43375 ns
-/// ```
-///
-/// 1024 is the last value that is better than the one before it on **every**
-/// axis, so it is the default. Past it the trade is real: 16384 is three times
-/// the throughput of 64 and five times the wake latency, which is the right
-/// choice for a batch pool and the wrong one for anything waiting on a reply.
-const BACKOFF_SPINS: u32 = 1024;
+/// Spin hints between empty search rounds. Combined with four rounds this
+/// preserves a brief retry opportunity without the old 65,536-spin budget.
+const BACKOFF_SPINS: u32 = 128;
 
 /// Jobs run between two heartbeats.
 const PROMOTE_EVERY: u64 = 64;

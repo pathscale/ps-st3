@@ -15,6 +15,12 @@
   previous displacement policy.
 
 
+### Changed
+
+- Locality and its derived presets use four empty search rounds with 128
+  spin hints per round before host parking. The former 64 by 1024 budget
+  burned several CPU cores between sparse bursts.
+
 ### Fixed
 
 - The final check after announcing sleep now includes peer queues, closing

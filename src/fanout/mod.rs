@@ -135,7 +135,8 @@ pub struct Tuning {
     pub share_displaced: bool,
     /// Keep displaced jobs in a FIFO inbox that idle peers can steal.
     ///
-    /// Only the warm LIFO slot remains private. This takes precedence over
+    /// The warm LIFO slot stays private until its fairness quota expires,
+    /// then its ready job also enters the stealable inbox. This takes precedence over
     /// `share_displaced` and wakes a peer when displaced work is published.
     /// It trades lock-handoff locality for prompt access to independent work.
     pub stealable_inbox: bool,
@@ -208,6 +209,27 @@ impl Tuning {
             injector_batch: INJECTOR_BATCH,
             local_wakes: true,
         }
+    }
+
+    /// Keep a warm LIFO slot for three polls, then expose its task to peers.
+    ///
+    /// Displaced work enters a stealable FIFO inbox. This is a Nagoya policy
+    /// inspired by Tokios local scheduling, not a Tokio implementation or
+    /// compatibility mode. Measure its sharing cost on contended workloads.
+    #[must_use]
+    pub fn almost_tokio() -> Self {
+        Self::locality()
+            .with_stealable_inbox(true)
+            .with_lifo_run_limit(3)
+    }
+
+    /// The almost_tokio policy with OS parking after an unsuccessful search.
+    ///
+    /// This removes the idle spin rounds; the host still determines how a
+    /// worker waits. With AtomicHost or StdHost, that wait blocks in the OS.
+    #[must_use]
+    pub fn parking() -> Self {
+        Self::almost_tokio().with_rounds_before_park(0)
     }
 
     /// Send every wake to the injector, where any worker can take it.
@@ -732,85 +754,22 @@ impl Pool {
             self.push(None, job);
             return;
         }
-        // The slot first, and whatever it held goes wherever
-        // `Tuning::share_displaced` says.
-        //
-        // # At most one task may be private to a worker, under `share_displaced`
-        //
-        // The slot is not stealable, which is the point: the task that just
-        // woke itself runs next, on the worker whose cache lines it is still
-        // in. That is worth having for one task and is a trap for two.
-        //
-        // A displaced job used to go to a private inbox behind the slot. Both
-        // are unreachable by any other worker, so a worker that accumulated
-        // several distinct tasks kept them, and nothing could take them back:
-        // the inbox drains into the private deque, the deque is shared only on
-        // a heartbeat counted in `mine.pop_back` calls, and the LIFO slot ahead
-        // of that in the loop starves the heartbeat for as long as any task
-        // keeps waking itself. Every wake was delivered; the work simply became
-        // invisible, which is why the `SeqCst` Dekker pair below did not fix
-        // it and why it looked like a lost wakeup.
-        //
-        // Measured on sixteen workers with eight self-waking client tasks,
-        // YCSB C: four runs in eight collapsed to one active worker with the
-        // other fifteen parked in `__ulock_wait`, at exactly the one-thread
-        // rate. Sending the displaced job to the injector keeps the locality
-        // win, which is entirely about the *first* task, and makes the second
-        // one somebody else's to take.
+        // Keep the newest ready task warm. Displacement policy chooses whether
+        // older work stays private, spills excess to the injector, or enters
+        // an immediately announced stealable inbox.
         let displaced = self.local[worker].lifo.lock().replace(job);
         let published_inbox = self.tuning.stealable_inbox && displaced.is_some();
         if let Some(displaced) = displaced {
-            // **The second displacement is the one that means something.**
-            //
-            // One task waking itself displaces nothing: it takes the slot,
-            // runs, and puts itself back into a slot the worker just emptied.
-            // Two tasks alternating displace each other, and the inbox behind
-            // the slot drains between them. Neither is an imbalance, and
-            // sending either to the injector would cost a wake for work that
-            // was going to be run here anyway. That is what made
-            // `share_displaced` lose 31% on a lock-bound update workload.
-            //
-            // A displacement arriving while the inbox is *already* occupied is
-            // different: it means a third task is queued behind two that this
-            // worker has not got to, which is the pile-up that cannot correct
-            // itself, because neither the slot nor the inbox is stealable and
-            // the slot starves the heartbeat that would share them.
-            //
-            // So under `share_displaced` the first one stays private and the
-            // rest go where anybody can reach them. Sharing from the *first*
-            // displacement was measured too and is worse on both sides: it
-            // took a lock-bound update workload from 943,606 to 651,554, and
-            // it did not buy anything the second-displacement rule does not.
-            //
-            // Off, this is the original behaviour: everything stays private.
-            // That is still the right default, because holding the line at one
-            // task costs 7% on lock-bound work for a tail that only appears on
-            // read-only work with many independent tasks. Which of those a
-            // table does is exactly what a flavor is for.
+            // share_displaced retains the first inbox job locally and sends
+            // further overflow to the injector. The stealable-inbox option
+            // instead keeps all displaced jobs in the shared FIFO inbox.
             if !self.tuning.stealable_inbox
                 && self.tuning.share_displaced
                 && !self.local[worker].inbox.is_empty()
             {
-                // **Published, not announced.**
-                //
-                // `push` plus a wake is what made this expensive on lock-bound
-                // work: the woken worker steals the job, runs it, blocks on the
-                // same row lock and parks again, so the pool pays a park/unpark
-                // round trip per displacement for work that was serialised
-                // anyway.
-                //
-                // The review's objection to that was starvation: an owner
-                // servicing self-wakes forever leaves this job behind while
-                // peers sleep. Real, and fixed below at the LIFO fairness
-                // boundary, where the owner services the injector itself. That
-                // path ends in `take_from_injector`, which already wakes one
-                // sleeper per job still queued. So the sleepers are told; they
-                // are told once per fairness boundary instead of once per
-                // displacement, which is the same news for a fraction of the
-                // round trips.
-                //
-                // A wake here would be the third mechanism for one job, and the
-                // one measured to cost the most.
+                // The owner services this injector at its fairness boundary,
+                // where excess work is announced in a batch. Avoid a peer
+                // wake for every lock handoff under this locality policy.
                 self.injector.push(displaced);
             } else {
                 self.local[worker].inbox.push(displaced);
@@ -828,9 +787,8 @@ impl Pool {
         // caught in a profile with all sixteen workers parked in `__ulock_wait`
         // while the run had work outstanding, at a sixth of normal throughput.
         core::sync::atomic::fence(Ordering::SeqCst);
-        // **This worker, and no other.** The job above went into this worker's
-        // slot or inbox, and neither is stealable, so waking anybody else
-        // wakes somebody who is not allowed to touch it.
+        // Always notify the owner of its private warm slot. The optional
+        // stealable inbox additionally announces its displaced work below.
         //
         // `wake` cannot be used here. It treats its argument as a fallback and
         // takes `trailing_zeros()` whenever any worker is asleep, so a private
@@ -1058,6 +1016,9 @@ impl Pool {
             // peers are busy. Service the injector at the local fairness
             // boundary so displaced work cannot wait forever behind self-wakes.
             let slot_budget_exhausted = lifo_run == lifo_run_limit;
+            if slot_budget_exhausted && self.tuning.stealable_inbox {
+                self.publish_capped_slot(w.id);
+            }
             if slot_budget_exhausted && self.tuning.share_displaced {
                 self.take_from_injector(&mut mine);
             }
@@ -1306,6 +1267,17 @@ impl Pool {
         taken
     }
 
+    /// A capped warm task becomes available to peers at the fairness boundary.
+    /// An idle peer may take it; otherwise its owner consumes the FIFO inbox.
+    fn publish_capped_slot(&self, id: usize) {
+        let job = self.local[id].lifo.lock().take();
+        if let Some(job) = job {
+            self.local[id].inbox.push(job);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            self.nudge(Some(id));
+        }
+    }
+
     /// Publish sleep intent, then recheck every reachable source of work.
     /// A publisher either observes our bit or its work appears in this check.
     fn prepare_to_park(&self, queue: &Queue<Job>, id: usize, rng: &mut u64) -> bool {
@@ -1547,6 +1519,31 @@ mod wake_distribution {
         assert!(pool.local[0].inbox.is_empty());
         assert!(pool.local[0].lifo.lock().is_some());
         assert_eq!(pool.steal_once(&thief, 1, &mut 456), 0);
+    }
+
+    #[test]
+    fn a_capped_warm_task_becomes_stealable_without_a_second_task() {
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(
+            2,
+            64,
+            host.clone(),
+            Tuning::locality()
+                .with_stealable_inbox(true)
+                .with_lifo_run_limit(3),
+        );
+        let thief = pool.local[1].queue.lock().take().unwrap();
+        pool.sleeping.store(1 << 1, Ordering::SeqCst);
+        pool.submit_local(0, super::Job::from_boxed(|| {}));
+        assert_eq!(pool.steal_once(&thief, 1, &mut 123), 0);
+        pool.publish_capped_slot(0);
+        assert_eq!(*host.unparked.lock().unwrap(), [1]);
+        assert_eq!(pool.steal_once(&thief, 1, &mut 456), 1);
+        assert!(thief.pop().is_some());
+        assert!(pool.local[0].lifo.lock().is_none());
+        assert!(pool.local[0].inbox.is_empty());
     }
 
     /// Displacement publishes to the injector without waking anybody.

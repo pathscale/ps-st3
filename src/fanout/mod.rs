@@ -113,38 +113,21 @@ pub struct Tuning {
     /// this worker is holding for somebody else therefore never becomes
     /// stealable, however long the queue behind it grows.
     ///
-    /// Lower means the worker looks at its own queue sooner, which costs
-    /// nothing when there is nothing there: sharing returns immediately unless
-    /// the private queue holds at least two jobs. That is what makes this a
-    /// cheaper answer to a pile-up than routing displaced work to the injector,
-    /// which pays a wake whether or not anybody needed one.
+    /// Lower means the worker probes alternative work sources more often.
+    /// When those probes find nothing, it resumes the ready local slot without
+    /// an idle backoff. More frequent probes still incur queue and steal costs.
     pub lifo_run_limit: u32,
     /// Where a job displaced from the LIFO slot goes.
     ///
-    /// `false`, the default, sends it to a private inbox behind the slot: one
-    /// swap and a `SegQueue` push, reachable by nobody until this worker
-    /// drains it. `true` sends it to the injector, where any worker can take
-    /// it, at the cost of a wake.
+    /// `false` sends it to the worker's private inbox. `true` keeps the
+    /// first displaced job in that inbox and sends further displaced jobs to
+    /// the shared injector while the inbox is occupied. The owner services
+    /// that injector at its LIFO fairness boundary; publication itself does
+    /// not wake another worker. The slot and first inbox job remain private.
     ///
-    /// **This is the difference between two failure modes, and both are real.**
-    ///
-    /// Private: a worker that accumulates several self-waking tasks keeps all
-    /// of them. The inbox drains into the private deque, the deque is shared
-    /// only on a heartbeat counted in `mine.pop_back` calls, and the LIFO slot
-    /// ahead of that in the loop starves the heartbeat for as long as any task
-    /// keeps waking itself. Measured on sixteen workers with eight self-waking
-    /// read-only tasks: four runs in eight collapsed to a single active worker
-    /// with the other fifteen parked, at exactly the one-thread rate. Every
-    /// wake was delivered. The work became invisible, which is why this looks
-    /// like a lost wakeup and is not one.
-    ///
-    /// Shared: every displacement is an injector push and a wake. On work that
-    /// is *lock*-bound rather than CPU-bound there is no parallelism to win and
-    /// the churn is pure cost. Measured on a 50% update workload: throughput
-    /// fell from 943,606 to 651,554 while cores busy went from 1.13 to 13.16.
-    ///
-    /// So it is a policy, not a fix. Read-mostly work with independent tasks
-    /// wants `true`; work that contends on row locks wants `false`.
+    /// Sharing makes excess ready work available to peers. Keeping it local
+    /// avoids queue contention on workloads dominated by lock handoffs. Both
+    /// policies still probe other work after `lifo_run_limit` slot jobs.
     pub share_displaced: bool,
     /// Whether [`Pool::submit_local`] keeps work on the calling worker.
     ///

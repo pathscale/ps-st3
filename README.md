@@ -259,6 +259,8 @@ feature adds `StdHost` with an `Instant` clock over this same implementation.
 `Tuning::with_stealable_inbox(true)` lets idle peers take displaced local jobs
 while retaining a warm LIFO slot between fairness boundaries. At the LIFO quota,
 the slot job also enters the stealable inbox, including a lone self-waking task.
+A lone job stays available to awake thieves without waking a sleeping peer;
+the active owner can run it. Spare local or inbox work still triggers a wake.
 It is a Rust callsite option, useful
 for independent tasks; measure its extra sharing cost on lock handoffs.
 

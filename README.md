@@ -265,3 +265,7 @@ for independent tasks; measure its extra sharing cost on lock handoffs.
 The opt-in presets are `Tuning::almost_tokio()` (a three-poll LIFO quota and
 shared FIFO inbox) and `Tuning::parking()` (the same policy with no idle spin
 rounds). These are Nagoya scheduler policies, not a Tokio compatibility mode.
+
+The default locality policy uses four empty search rounds and 128 spin hints
+per round before host parking. Keep CPU use between bursts alongside throughput
+when tuning this budget.

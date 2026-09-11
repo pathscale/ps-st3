@@ -1,6 +1,20 @@
 # 0.6.2 (2026-09-12)
 
+### Added
+
+- `atomic-host` exposes the blocking OS parker as `AtomicHost` without Rust
+  `std`; callers supply a monotonic clock and worker lifecycle. `StdHost`
+  delegates to the same permit protocol.
+- `Tuning::with_stealable_inbox` exposes displaced local jobs to idle peers
+  through a FIFO inbox. The warm LIFO slot remains private; existing presets
+  keep their previous displacement policy.
+
+
 ### Fixed
+
+- The final check after announcing sleep now includes peer queues, closing
+  the interval between a worker's last search and its sleep announcement.
+  Sharing uses a publication fence before checking for sleeping peers.
 
 - After reaching its LIFO fairness quota, a worker still probes other queues
   first, then resumes ready local work without an idle backoff. Previously

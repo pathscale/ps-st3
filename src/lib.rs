@@ -52,8 +52,8 @@
 
 extern crate alloc;
 
-// `host` brings an operating system with it, so it brings `std`. Everything
-// else here, the queues and the pool alike, stays free of both.
+// Only the convenience `host` clock adapter uses Rust std. `atomic-host`
+// uses blocking platform calls without std; the queues and pool need neither.
 #[cfg(feature = "host")]
 extern crate std;
 

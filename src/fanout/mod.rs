@@ -49,9 +49,13 @@ use crossbeam_utils::CachePadded;
 use crate::lifo::{Stealer, Worker as Queue};
 use spin::Mutex;
 
+#[cfg(feature = "atomic-host")]
+mod atomic_host;
 #[cfg(feature = "host")]
 mod host;
 mod job;
+#[cfg(feature = "atomic-host")]
+pub use atomic_host::AtomicHost;
 #[cfg(feature = "host")]
 pub use host::StdHost;
 pub use job::{Act, Job};
@@ -129,6 +133,12 @@ pub struct Tuning {
     /// avoids queue contention on workloads dominated by lock handoffs. Both
     /// policies still probe other work after `lifo_run_limit` slot jobs.
     pub share_displaced: bool,
+    /// Keep displaced jobs in a FIFO inbox that idle peers can steal.
+    ///
+    /// Only the warm LIFO slot remains private. This takes precedence over
+    /// `share_displaced` and wakes a peer when displaced work is published.
+    /// It trades lock-handoff locality for prompt access to independent work.
+    pub stealable_inbox: bool,
     /// Whether [`Pool::submit_local`] keeps work on the calling worker.
     ///
     /// `false` makes it forward to [`Pool::submit_job`], which is the whole of
@@ -191,6 +201,7 @@ impl Tuning {
         Self {
             lifo_run_limit: LIFO_RUN_LIMIT,
             share_displaced: false,
+            stealable_inbox: false,
             rounds_before_park: ROUNDS_BEFORE_PARK,
             backoff_spins: BACKOFF_SPINS,
             promote_every: PROMOTE_EVERY,
@@ -251,6 +262,13 @@ impl Tuning {
     #[must_use]
     pub fn with_share_displaced(mut self, share: bool) -> Self {
         self.share_displaced = share;
+        self
+    }
+
+    /// Set [`stealable_inbox`](Self::stealable_inbox), without changing the LIFO quota.
+    #[must_use]
+    pub fn with_stealable_inbox(mut self, enabled: bool) -> Self {
+        self.stealable_inbox = enabled;
         self
     }
 
@@ -740,6 +758,7 @@ impl Pool {
         // win, which is entirely about the *first* task, and makes the second
         // one somebody else's to take.
         let displaced = self.local[worker].lifo.lock().replace(job);
+        let published_inbox = self.tuning.stealable_inbox && displaced.is_some();
         if let Some(displaced) = displaced {
             // **The second displacement is the one that means something.**
             //
@@ -768,7 +787,10 @@ impl Pool {
             // task costs 7% on lock-bound work for a tail that only appears on
             // read-only work with many independent tasks. Which of those a
             // table does is exactly what a flavor is for.
-            if self.tuning.share_displaced && !self.local[worker].inbox.is_empty() {
+            if !self.tuning.stealable_inbox
+                && self.tuning.share_displaced
+                && !self.local[worker].inbox.is_empty()
+            {
                 // **Published, not announced.**
                 //
                 // `push` plus a wake is what made this expensive on lock-bound
@@ -818,6 +840,9 @@ impl Pool {
         // even though a wake was sent, and it is the shape that shows up as
         // one busy core with tasks outstanding.
         self.wake_specific(worker);
+        if published_inbox {
+            self.nudge(Some(worker));
+        }
     }
 
     /// Wake one named worker, because the work is private to it.
@@ -1051,6 +1076,17 @@ impl Pool {
                 continue;
             }
 
+            // With a stealable inbox, consume one FIFO job at a fairness
+            // boundary and leave the remaining backlog visible to peers.
+            if self.tuning.stealable_inbox {
+                if let Some(job) = self.local[w.id].inbox.pop() {
+                    spins = 0;
+                    job.run();
+                    self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
             // 1.5. What this worker handed back to itself.
             //
             //      Moved into `mine` rather than run from here. Running it
@@ -1066,7 +1102,7 @@ impl Pool {
             //      task that just yielded still runs next and keeps its cache
             //      lines, and subject to the same promotion that makes local
             //      work stealable on the heartbeat.
-            {
+            if !self.tuning.stealable_inbox {
                 let mut moved = 0usize;
                 while let Some(job) = self.local[w.id].inbox.pop() {
                     mine.push_back(job);
@@ -1192,26 +1228,10 @@ impl Pool {
                 continue;
             }
 
-            // Nothing anywhere, so this worker sleeps.
-            //
-            // **Announce first, then look.** A submit publishes its job and
-            // then reads the bitmap; this sets its bit and then reads the
-            // injector. Two store-then-load pairs against different locations,
-            // so only `SeqCst` on all four makes at least one of them see the
-            // other. Announcing after the look, or announcing with a weaker
-            // ordering, lets a worker sleep on a job that is already queued.
+            // Announce before the final check, including work another worker
+            // published after our last steal attempt but before seeing our bit.
             let bit = 1usize << w.id;
-            self.sleeping.fetch_or(bit, Ordering::SeqCst);
-
-            // The inbox is checked alongside the injector, and for the same
-            // reason: `submit_local` publishes and then reads this bitmap, so
-            // announcing before looking is what stops a worker sleeping on a
-            // job already handed to it.
-            if !self.injector.is_empty()
-                || !self.local[w.id].inbox.is_empty()
-                || self.local[w.id].lifo.lock().is_some()
-            {
-                self.sleeping.fetch_and(!bit, Ordering::SeqCst);
+            if !self.prepare_to_park(&queue, w.id, &mut rng) {
                 continue;
             }
             // Checked before parking so a worker cannot sleep through the end;
@@ -1286,6 +1306,22 @@ impl Pool {
         taken
     }
 
+    /// Publish sleep intent, then recheck every reachable source of work.
+    /// A publisher either observes our bit or its work appears in this check.
+    fn prepare_to_park(&self, queue: &Queue<Job>, id: usize, rng: &mut u64) -> bool {
+        let bit = 1usize << id;
+        self.sleeping.fetch_or(bit, Ordering::SeqCst);
+        if !self.injector.is_empty()
+            || !self.local[id].inbox.is_empty()
+            || self.local[id].lifo.lock().is_some()
+            || self.steal_once(queue, id, rng) > 0
+        {
+            self.sleeping.fetch_and(!bit, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
     /// Publish some of this worker's private queue where thieves can reach it.
     ///
     /// **Only when somebody is asleep.** With every worker busy there is nobody
@@ -1334,6 +1370,9 @@ impl Pool {
             }
         }
         if shared > 0 {
+            // Deque publication is release-only. Pair it with the sleeper's
+            // SeqCst announcement before inspecting the sleep bitmap.
+            core::sync::atomic::fence(Ordering::SeqCst);
             // One wake per job published. Waking a single worker for a batch
             // leaves the rest of the batch reachable in principle and unseen
             // in practice.
@@ -1372,6 +1411,16 @@ impl Pool {
             let victim = (start + offset) % workers;
             if victim == id {
                 continue;
+            }
+            if self.tuning.stealable_inbox {
+                if let Some(job) = self.local[victim].inbox.pop() {
+                    // This worker owns `queue`; a full queue already contains
+                    // work, but preserve the stolen job even in that case.
+                    if let Err(job) = queue.push(job) {
+                        self.push(Some(id), job);
+                    }
+                    return 1;
+                }
             }
             let got = self.stealers[victim]
                 .steal(queue, |n| (n.min(PULL_BATCH) + 1) / 2)
@@ -1450,6 +1499,54 @@ mod wake_distribution {
             0,
             "a fairness probe may check other queues, but ready work is not idle"
         );
+    }
+
+    #[test]
+    fn work_shared_between_last_search_and_sleep_is_not_stranded() {
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(2, 64, host.clone(), Tuning::locality());
+        let owner = pool.local[0].queue.lock().take().unwrap();
+        let peer = pool.local[1].queue.lock().take().unwrap();
+        let mut rng = 123;
+        assert_eq!(pool.steal_once(&owner, 0, &mut rng), 0);
+        // The producer shares after our last search, while no sleeper is visible.
+        let mut mine = alloc::collections::VecDeque::new();
+        mine.push_back(super::Job::from_boxed(|| {}));
+        mine.push_back(super::Job::from_boxed(|| {}));
+        pool.share(&mut mine, &peer, 1);
+        assert!(host.unparked.lock().unwrap().is_empty());
+        assert!(
+            !pool.prepare_to_park(&owner, 0, &mut rng),
+            "shared work arrived before sleep intent; recheck it before blocking"
+        );
+        assert!(owner.pop().is_some());
+        assert_eq!(pool.sleeping.load(Ordering::SeqCst) & 1, 0);
+    }
+
+    #[test]
+    fn stealable_inbox_exposes_displacement_but_keeps_the_warm_slot_private() {
+        let host = Arc::new(RecordingHost {
+            unparked: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::with_tuning(
+            2,
+            64,
+            host.clone(),
+            Tuning::locality().with_stealable_inbox(true),
+        );
+        pool.sleeping.store(1 << 1, Ordering::SeqCst);
+        pool.submit_local(0, super::Job::from_boxed(|| {}));
+        assert!(host.unparked.lock().unwrap().is_empty());
+        pool.submit_local(0, super::Job::from_boxed(|| {}));
+        assert_eq!(*host.unparked.lock().unwrap(), [1]);
+        let thief = pool.local[1].queue.lock().take().unwrap();
+        assert_eq!(pool.steal_once(&thief, 1, &mut 123), 1);
+        assert!(thief.pop().is_some());
+        assert!(pool.local[0].inbox.is_empty());
+        assert!(pool.local[0].lifo.lock().is_some());
+        assert_eq!(pool.steal_once(&thief, 1, &mut 456), 0);
     }
 
     /// Displacement publishes to the injector without waking anybody.

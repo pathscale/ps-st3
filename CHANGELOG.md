@@ -2,9 +2,10 @@
 
 ### Added
 
-- `Tuning::almost_tokio()` names the three-poll LIFO/FIFO-sharing policy;
-  `Tuning::parking()` adds immediate host parking after an unsuccessful search.
-  Both are opt-in and available without Rust std.
+- `Tuning::almost_tokio()` combines a three-poll LIFO quota, FIFO sharing and
+  immediate host parking after an unsuccessful search. It is opt-in and
+  available without Rust std. This is the policy named `parking` in early
+  benchmark reports; the earlier aggressive-spin preset was retired.
 
 - `atomic-host` exposes the blocking OS parker as `AtomicHost` without Rust
   `std`; callers supply a monotonic clock and worker lifecycle. `StdHost`

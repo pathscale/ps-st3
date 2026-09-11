@@ -185,23 +185,19 @@ impl Tuning {
 
     /// Keep a warm LIFO slot for three polls, then expose its task to peers.
     ///
-    /// Displaced work enters a stealable FIFO inbox. This is a Nagoya policy
-    /// inspired by local scheduling in Tokio, not a Tokio implementation or
-    /// compatibility mode. Measure its sharing cost on contended workloads.
+    /// Displaced work enters a stealable FIFO inbox. An unsuccessful search
+    /// parks without idle spin rounds; the host determines how a worker waits.
+    /// With AtomicHost or StdHost, that wait blocks in the OS.
+    ///
+    /// This is a Nagoya policy inspired by local scheduling in Tokio, not a
+    /// Tokio implementation or compatibility mode. Measure its sharing cost
+    /// on contended workloads.
     #[must_use]
     pub fn almost_tokio() -> Self {
         Self::locality()
             .with_stealable_inbox(true)
             .with_lifo_run_limit(3)
-    }
-
-    /// The almost_tokio policy with OS parking after an unsuccessful search.
-    ///
-    /// This removes the idle spin rounds; the host still determines how a
-    /// worker waits. With AtomicHost or StdHost, that wait blocks in the OS.
-    #[must_use]
-    pub fn parking() -> Self {
-        Self::almost_tokio().with_rounds_before_park(0)
+            .with_rounds_before_park(0)
     }
 
     /// Send every wake to the injector, where any worker can take it.

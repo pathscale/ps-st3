@@ -3,10 +3,10 @@
 //! Available with `atomic-host` on the platforms supported by `atomic-wait`.
 //! The caller provides workers and a monotonic clock; no threads are created.
 
+use crate::cache_padded::CachePadded;
 use crate::config::AtomicUnsignedLong;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-use crossbeam_utils::CachePadded;
 
 use super::Host;
 

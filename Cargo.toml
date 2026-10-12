@@ -26,10 +26,9 @@ autobenches = false
 name = "st3"
 
 [dependencies]
-crossbeam-utils = { version = "0.8.14", default-features = false }
 # The `fanout` injector: one lock-free queue every worker drains, in place of
-# the per-worker intakes nothing but their owner could reach. Same MSRV as this
-# crate, and its only dependency is `crossbeam-utils`, which is already here.
+# the per-worker intakes nothing but their owner could reach. It may pull
+# `crossbeam-utils` transitively; `st3` does not depend on it directly.
 crossbeam-queue = { version = "0.3.12", default-features = false, features = [
     "alloc",
 ], optional = true }

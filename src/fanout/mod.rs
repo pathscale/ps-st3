@@ -42,9 +42,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::cache_padded::CachePadded;
 use crate::config::AtomicUnsignedLong;
 use crossbeam_queue::SegQueue;
-use crossbeam_utils::CachePadded;
 
 use crate::lifo::{Stealer, Worker as Queue};
 use spin::Mutex;

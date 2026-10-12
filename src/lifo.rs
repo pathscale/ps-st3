@@ -44,7 +44,7 @@ use core::mem::{transmute, MaybeUninit};
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crossbeam_utils::CachePadded;
+use crate::cache_padded::CachePadded;
 
 use crate::config::{AtomicUnsignedLong, AtomicUnsignedShort, UnsignedShort};
 use crate::loom_exports::cell::UnsafeCell;

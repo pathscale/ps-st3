@@ -36,18 +36,19 @@
 //! `no_std` and knows nothing else about a platform. `StdHost`, behind the
 //! `host` feature, is what those look like with a `std` to implement them.
 
+use crate::loom_exports::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::ptr;
 
 use crate::cache_padded::CachePadded;
 use crate::config::AtomicUnsignedLong;
-use crossbeam_queue::SegQueue;
-
 use crate::lifo::{Stealer, Worker as Queue};
-use spin::Mutex;
+
+mod injector;
+use injector::Injector;
 
 #[cfg(feature = "atomic-host")]
 mod atomic_host;
@@ -401,7 +402,7 @@ impl Runner {
 /// value once, and from then on the owning thread's pushes and pops touch
 /// nothing shared.
 struct Local {
-    queue: Mutex<Option<Queue<Job>>>,
+    queue: AtomicPtr<Queue<Job>>,
     completed: AtomicUnsignedLong,
     /// Work a worker gave back to itself, bypassing the injector.
     ///
@@ -411,14 +412,14 @@ struct Local {
     /// one injector every worker contends on, plus a wake. Under a workload
     /// whose tasks yield in a retry loop that is the whole cost.
     ///
-    /// A `SegQueue` rather than the sharing deque because that deque is moved
-    /// out of `queue` by `run` and owned by the running thread for the whole
-    /// loop; this is reachable while that is in flight.
-    inbox: SegQueue<Job>,
+    /// The in-crate segmented injector rather than the sharing deque because
+    /// that deque is moved out of `queue` by `run` and owned by the running
+    /// thread for the whole loop; this inbox remains reachable while it is in flight.
+    inbox: Injector<Job>,
     /// The single most recent job this worker handed itself.
     ///
     /// A task that wakes itself almost always wants to run *next*, and going
-    /// through `inbox` to say so costs a `SegQueue` push and pop, which is an
+    /// through `inbox` to say so costs a `Injector` push and pop, which is an
     /// MPMC structure priced for many producers. This is one uncontended
     /// swap, and it is what tokio's LIFO slot is for. Measured, the inbox
     /// alone left a read-only workload at a third of tokio's throughput
@@ -427,13 +428,94 @@ struct Local {
     /// Holds one job. A second self-wake displaces the first into `inbox`,
     /// where it is still found, so nothing is lost and the slot never becomes
     /// a queue of its own.
-    lifo: Mutex<Option<Job>>,
+    lifo: AtomicJobSlot,
+}
+
+impl Local {
+    fn take_queue(&self) -> Option<Queue<Job>> {
+        let pointer = self.queue.swap(ptr::null_mut(), Ordering::AcqRel);
+        if pointer.is_null() {
+            None
+        } else {
+            // SAFETY: swap transfers the slot's sole Box ownership to this caller.
+            Some(unsafe { *Box::from_raw(pointer) })
+        }
+    }
+
+    fn put_queue(&self, queue: Queue<Job>) {
+        let pointer = Box::into_raw(Box::new(queue));
+        if let Err(pointer) = self.queue.compare_exchange(
+            ptr::null_mut(),
+            pointer,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            // SAFETY: failed publication returns the unique Box pointer.
+            unsafe { drop(Box::from_raw(pointer)) };
+            panic!("worker deque slot was occupied during handover");
+        }
+    }
+}
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        let pointer = self.queue.load(Ordering::Relaxed);
+        if !pointer.is_null() {
+            // SAFETY: &mut self excludes every concurrent queue-slot operation.
+            unsafe { drop(Box::from_raw(pointer)) };
+        }
+    }
+}
+
+/// A one-item MPMC exchange slot. Boxing the Job is the price of moving its
+/// two-word representation through one atomic pointer without a lock.
+struct AtomicJobSlot(AtomicPtr<Job>);
+
+impl AtomicJobSlot {
+    fn new() -> Self {
+        Self(AtomicPtr::new(ptr::null_mut()))
+    }
+
+    fn replace(&self, job: Job) -> Option<Job> {
+        let pointer = Box::into_raw(Box::new(job));
+        let previous = self.0.swap(pointer, Ordering::AcqRel);
+        if previous.is_null() {
+            None
+        } else {
+            // SAFETY: swap transfers the previous Box to exactly one caller.
+            Some(unsafe { *Box::from_raw(previous) })
+        }
+    }
+
+    fn take(&self) -> Option<Job> {
+        let previous = self.0.swap(ptr::null_mut(), Ordering::AcqRel);
+        if previous.is_null() {
+            None
+        } else {
+            // SAFETY: swap transfers the previous Box to exactly one caller.
+            Some(unsafe { *Box::from_raw(previous) })
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        !self.0.load(Ordering::Acquire).is_null()
+    }
+}
+
+impl Drop for AtomicJobSlot {
+    fn drop(&mut self) {
+        let pointer = self.0.load(Ordering::Relaxed);
+        if !pointer.is_null() {
+            // SAFETY: &mut self excludes every concurrent slot operation.
+            unsafe { drop(Box::from_raw(pointer)) };
+        }
+    }
 }
 
 // Distinguishes one pool from another, so a `Runner` cannot be handed to the
 // wrong one. Wrapping is harmless: it would take a `usize` of pools to reach a
 // collision, and a collision only matters between two live pools.
-static NEXT_POOL: AtomicUsize = AtomicUsize::new(0);
+static NEXT_POOL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// A fixed set of workers, their deques, and the injector work arrives through.
 ///
@@ -453,7 +535,7 @@ pub struct Pool {
     /// work there is, did not hold. Six different scheduling policies were
     /// tried on top of it and all six lost. A lock-free queue every worker
     /// drains makes the rule true.
-    injector: SegQueue<Job>,
+    injector: Injector<Job>,
     host: Arc<dyn Host>,
     running: AtomicBool,
     tuning: Tuning,
@@ -561,10 +643,10 @@ impl Pool {
             let queue = Queue::new(capacity);
             stealers.push(queue.stealer());
             local.push(CachePadded::new(Local {
-                queue: Mutex::new(Some(queue)),
+                queue: AtomicPtr::new(Box::into_raw(Box::new(queue))),
                 completed: AtomicUnsignedLong::new(0),
-                inbox: SegQueue::new(),
-                lifo: Mutex::new(None),
+                inbox: Injector::new(),
+                lifo: AtomicJobSlot::new(),
             }));
         }
         Arc::new(Self {
@@ -572,7 +654,7 @@ impl Pool {
             local,
             stealers,
             host,
-            injector: SegQueue::new(),
+            injector: Injector::new(),
             running: AtomicBool::new(true),
             tuning,
             sleeping: AtomicUsize::new(0),
@@ -685,7 +767,7 @@ impl Pool {
         // Keep the newest ready task warm. Displacement policy chooses whether
         // older work stays private, spills excess to the injector, or enters
         // an immediately announced stealable inbox.
-        let displaced = self.local[worker].lifo.lock().replace(job);
+        let displaced = self.local[worker].lifo.replace(job);
         let published_inbox = self.tuning.stealable_inbox && displaced.is_some();
         if let Some(displaced) = displaced {
             // share_displaced retains the first inbox job locally and sends
@@ -710,11 +792,11 @@ impl Pool {
         // the slot and the inbox, and this stores the job and then reads the
         // bit. That only guarantees one side sees the other if *both* pairs are
         // separated by a full barrier. The worker's `fetch_or` is `SeqCst` and
-        // is one; on this side the job went into a `spin::Mutex`, whose release
+        // is one; on this side the job went in through an AcqRel `AtomicPtr` exchange, whose release
         // is a store-release and is not. So both could miss, and both did:
         // caught in a profile with all sixteen workers parked in `__ulock_wait`
         // while the run had work outstanding, at a sixth of normal throughput.
-        core::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         // Always notify the owner of its private warm slot. The optional
         // stealable inbox additionally announces its displaced work below.
         //
@@ -891,7 +973,7 @@ impl Pool {
         );
         // `let ... else` is 1.65 and this crate supports 1.60, which the queues
         // have no reason to give up because a pool was added beside them.
-        let queue = match self.local[w.id].queue.lock().take() {
+        let queue = match self.local[w.id].take_queue() {
             Some(queue) => queue,
             None => return false,
         };
@@ -929,7 +1011,7 @@ impl Pool {
             //    Written without a `let` chain: this crate supports Rust 1.60
             //    and those are 2024.
             let from_slot = if lifo_run < lifo_run_limit {
-                self.local[w.id].lifo.lock().take()
+                self.local[w.id].lifo.take()
             } else {
                 None
             };
@@ -1076,7 +1158,7 @@ impl Pool {
             // work: run it instead of paying an idle backoff. Release its lock
             // before running, since this job may wake itself into the slot.
             let ready_slot = if slot_budget_exhausted {
-                self.local[w.id].lifo.lock().take()
+                self.local[w.id].lifo.take()
             } else {
                 None
             };
@@ -1144,13 +1226,13 @@ impl Pool {
         }
 
         // Put it back, so a caller that restarts this worker finds its deque.
-        *self.local[w.id].queue.lock() = Some(queue);
+        self.local[w.id].put_queue(queue);
         true
     }
 
     /// Move a run of what arrived from outside into this worker's own queue.
     ///
-    /// **Pop, do not ask.** `SegQueue::len` reads both ends, so a worker that
+    /// **Pop, do not ask.** `Injector::len` reads both ends, so a worker that
     /// calls it every empty round turns the length counter into the contended
     /// line the per-worker intakes used to be. A failed pop answers the same
     /// question and touches one end.
@@ -1199,10 +1281,10 @@ impl Pool {
     /// The active owner consumes a lone inbox entry on its next step. If it has
     /// other work, announce the extra capacity a peer can use.
     fn publish_capped_slot(&self, id: usize, has_other_ready_work: bool) {
-        let job = self.local[id].lifo.lock().take();
+        let job = self.local[id].lifo.take();
         if let Some(job) = job {
             self.local[id].inbox.push(job);
-            core::sync::atomic::fence(Ordering::SeqCst);
+            fence(Ordering::SeqCst);
             if has_other_ready_work || self.local[id].inbox.len() > 1 {
                 self.nudge(Some(id));
             }
@@ -1216,7 +1298,7 @@ impl Pool {
         self.sleeping.fetch_or(bit, Ordering::SeqCst);
         if !self.injector.is_empty()
             || !self.local[id].inbox.is_empty()
-            || self.local[id].lifo.lock().is_some()
+            || self.local[id].lifo.is_some()
             || self.steal_once(queue, id, rng) > 0
         {
             self.sleeping.fetch_and(!bit, Ordering::SeqCst);
@@ -1275,7 +1357,7 @@ impl Pool {
         if shared > 0 {
             // Deque publication is release-only. Pair it with the sleeper's
             // SeqCst announcement before inspecting the sleep bitmap.
-            core::sync::atomic::fence(Ordering::SeqCst);
+            fence(Ordering::SeqCst);
             // One wake per job published. Waking a single worker for a batch
             // leaves the rest of the batch reachable in principle and unseen
             // in practice.
@@ -1410,8 +1492,8 @@ mod wake_distribution {
             unparked: Mutex::new(Vec::new()),
         });
         let pool = Pool::with_tuning(2, 64, host.clone(), Tuning::locality());
-        let owner = pool.local[0].queue.lock().take().unwrap();
-        let peer = pool.local[1].queue.lock().take().unwrap();
+        let owner = pool.local[0].take_queue().unwrap();
+        let peer = pool.local[1].take_queue().unwrap();
         let mut rng = 123;
         assert_eq!(pool.steal_once(&owner, 0, &mut rng), 0);
         // The producer shares after our last search, while no sleeper is visible.
@@ -1444,11 +1526,11 @@ mod wake_distribution {
         assert!(host.unparked.lock().unwrap().is_empty());
         pool.submit_local(0, super::Job::from_boxed(|| {}));
         assert_eq!(*host.unparked.lock().unwrap(), [1]);
-        let thief = pool.local[1].queue.lock().take().unwrap();
+        let thief = pool.local[1].take_queue().unwrap();
         assert_eq!(pool.steal_once(&thief, 1, &mut 123), 1);
         assert!(thief.pop().is_some());
         assert!(pool.local[0].inbox.is_empty());
-        assert!(pool.local[0].lifo.lock().is_some());
+        assert!(pool.local[0].lifo.is_some());
         assert_eq!(pool.steal_once(&thief, 1, &mut 456), 0);
     }
 
@@ -1465,7 +1547,7 @@ mod wake_distribution {
                 .with_stealable_inbox(true)
                 .with_lifo_run_limit(3),
         );
-        let thief = pool.local[1].queue.lock().take().unwrap();
+        let thief = pool.local[1].take_queue().unwrap();
         pool.sleeping.store(1 << 1, Ordering::SeqCst);
         pool.submit_local(0, super::Job::from_boxed(|| {}));
         assert_eq!(pool.steal_once(&thief, 1, &mut 123), 0);
@@ -1473,7 +1555,7 @@ mod wake_distribution {
         assert!(host.unparked.lock().unwrap().is_empty());
         assert_eq!(pool.steal_once(&thief, 1, &mut 456), 1);
         assert!(thief.pop().is_some());
-        assert!(pool.local[0].lifo.lock().is_none());
+        assert!(!pool.local[0].lifo.is_some());
         assert!(pool.local[0].inbox.is_empty());
     }
 
@@ -1493,8 +1575,8 @@ mod wake_distribution {
             host.unparked.lock().unwrap().clear();
             pool.publish_capped_slot(0, private_backlog);
             assert_eq!(*host.unparked.lock().unwrap(), [1]);
-            assert!(pool.local[0].lifo.lock().is_none());
-            let thief = pool.local[1].queue.lock().take().unwrap();
+            assert!(!pool.local[0].lifo.is_some());
+            let thief = pool.local[1].take_queue().unwrap();
             assert_eq!(pool.steal_once(&thief, 1, &mut 456), 1);
             assert!(thief.pop().is_some());
         }

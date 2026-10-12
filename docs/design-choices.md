@@ -132,7 +132,7 @@ case.
 
 Correct. `Vec<Local>` packs the records, so one worker's counter and another's
 intake lock land on the same line and every completed task writes to it.
-The in-crate `CachePadded` wrapper is the fix, with a worker-local count
+The in-crate `CachePadded` type is the fix, with a worker-local count
 published on demand if the accounting is kept at all.
 
 ### Four probes do not bound steal latency

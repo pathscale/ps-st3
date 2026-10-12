@@ -86,9 +86,9 @@ signal, so a caller that needs to know when a batch finished counts for itself.
 And it does not apply backpressure: `capacity` bounds what a worker holds, not
 what a caller may hand it.
 
-Features: `fanout` is on by default and costs one dependency, `spin`, which has
-no dependencies of its own. `host` is off by default and is what links `std`,
-for the `StdHost` above.
+Features: `fanout` is on by default and adds no queue or lock dependency.
+`host` is off by default and links `std`, for the `StdHost` above; its platform
+parking implementation uses the optional `atomic-wait` dependency.
 
 `docs/design-choices.md` records the decisions behind it, an external review of
 it, and which of that review's findings were taken.

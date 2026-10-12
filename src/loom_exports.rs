@@ -7,6 +7,7 @@ pub(crate) mod sync {
         pub(crate) use loom::sync::atomic::AtomicU32;
         #[cfg(target_has_atomic = "64")]
         pub(crate) use loom::sync::atomic::AtomicU64;
+        pub(crate) use loom::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
     }
 }
 #[cfg(not(all(test, st3_loom)))]
@@ -18,6 +19,7 @@ pub(crate) mod sync {
         pub(crate) use core::sync::atomic::AtomicU32;
         #[cfg(target_has_atomic = "64")]
         pub(crate) use core::sync::atomic::AtomicU64;
+        pub(crate) use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
     }
 }
 

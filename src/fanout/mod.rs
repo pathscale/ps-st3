@@ -403,6 +403,8 @@ impl Runner {
 /// nothing shared.
 struct Local {
     queue: AtomicPtr<Queue<Job>>,
+    /// Whether this worker currently accepts private local submissions.
+    accepting_local: AtomicBool,
     completed: AtomicUnsignedLong,
     /// Work a worker gave back to itself, bypassing the injector.
     ///
@@ -576,6 +578,52 @@ pub struct Pool {
     idle_backoffs: AtomicUsize,
 }
 
+/// Returns a worker's pending work and deque on normal return or unwind.
+struct RunGuard<'a> {
+    pool: &'a Pool,
+    id: usize,
+    queue: Option<Queue<Job>>,
+    mine: VecDeque<Job>,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        let local = &self.pool.local[self.id];
+
+        // Stop private publication before draining. Together with the
+        // submitter's publication fence and final flag check, this ensures
+        // that a racing submission is drained here or by its submitter.
+        local.accepting_local.store(false, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+
+        while let Some(job) = self.mine.pop_front() {
+            self.pool.injector.push(job);
+        }
+
+        if let Some(queue) = self.queue.take() {
+            // Keep the owner end until every remaining unclaimed job has
+            // been published. Jobs already claimed by thieves remain theirs.
+            while let Some(job) = queue.pop() {
+                self.pool.injector.push(job);
+            }
+
+            self.pool.flush_local(self.id);
+            self.pool
+                .sleeping
+                .fetch_and(!(1usize << self.id), Ordering::SeqCst);
+
+            // Restore ownership before invoking a caller-supplied Host.
+            local.put_queue(queue);
+        }
+
+        // Include work already spilled directly to the injector. Waking
+        // peers must not depend solely on how many private jobs we moved.
+        if !self.pool.injector.is_empty() {
+            self.pool.nudge_many(None, self.pool.workers());
+        }
+    }
+}
+
 impl Pool {
     /// A pool of `workers` deques, each holding `capacity` tasks.
     ///
@@ -644,6 +692,7 @@ impl Pool {
             stealers.push(queue.stealer());
             local.push(CachePadded::new(Local {
                 queue: AtomicPtr::new(Box::into_raw(Box::new(queue))),
+                accepting_local: AtomicBool::new(false),
                 completed: AtomicUnsignedLong::new(0),
                 inbox: Injector::new(),
                 lifo: AtomicJobSlot::new(),
@@ -743,7 +792,7 @@ impl Pool {
         self.sleeping.load(Ordering::Acquire) != 0
     }
 
-    /// Hand work straight to one worker, skipping the injector.
+    /// Hand work straight to a running worker, skipping the injector.
     ///
     /// For the caller that *is* that worker: a task rescheduling itself, or a
     /// wake happening on a worker thread. Going through [`Pool::submit_job`]
@@ -757,10 +806,17 @@ impl Pool {
     ///
     /// A worker that is asleep is woken, so this is still safe to call from
     /// another thread; it just has nothing to offer one.
+    ///
+    /// If the worker is not running, work goes to the shared injector instead.
+    /// A submission racing the worker's exit may also become shared work.
     pub fn submit_local(&self, worker: usize, job: Job) {
         // Off by policy: see `Tuning::local_wakes` for the measurement behind
         // this being a switch rather than a decision.
         if !self.tuning.local_wakes {
+            self.push(None, job);
+            return;
+        }
+        if !self.local[worker].accepting_local.load(Ordering::SeqCst) {
             self.push(None, job);
             return;
         }
@@ -791,12 +847,22 @@ impl Pool {
         // sleep path is a Dekker pair: the worker stores its bit and then reads
         // the slot and the inbox, and this stores the job and then reads the
         // bit. That only guarantees one side sees the other if *both* pairs are
-        // separated by a full barrier. The worker's `fetch_or` is `SeqCst` and
-        // is one; on this side the job went in through an AcqRel `AtomicPtr` exchange, whose release
-        // is a store-release and is not. So both could miss, and both did:
+        // separated by a full barrier. The worker fences after its SeqCst
+        // sleep announcement; this side also needs a fence after the AcqRel
+        // slot exchange. Without both fences, both could miss, and both did:
         // caught in a profile with all sixteen workers parked in `__ulock_wait`
         // while the run had work outstanding, at a sixth of normal throughput.
         fence(Ordering::SeqCst);
+        // The owner may have exited after our first flag check. Publication
+        // must precede this check so either its guard or this submitter moves
+        // pending private work to the injector.
+        if !self.local[worker].accepting_local.load(Ordering::SeqCst) {
+            self.flush_local(worker);
+            // Displacement may already have spilled work directly to the
+            // injector, even if another consumer emptied the local sources.
+            self.nudge_many(None, self.workers());
+            return;
+        }
         // Always notify the owner of its private warm slot. The optional
         // stealable inbox additionally announces its displaced work below.
         //
@@ -810,6 +876,16 @@ impl Pool {
         self.wake_specific(worker);
         if published_inbox {
             self.nudge(Some(worker));
+        }
+    }
+
+    /// Move pending slot and inbox jobs to the shared injector.
+    fn flush_local(&self, worker: usize) {
+        if let Some(job) = self.local[worker].lifo.take() {
+            self.injector.push(job);
+        }
+        while let Some(job) = self.local[worker].inbox.pop() {
+            self.injector.push(job);
         }
     }
 
@@ -958,6 +1034,10 @@ impl Pool {
     /// Returns once [`shut_down`](Pool::shut_down) has been called and this
     /// worker has nothing left to do.
     ///
+    /// If a boxed task panics and unwinds, its panic propagates to the caller.
+    /// Pending work is returned to the shared injector and the worker's deque
+    /// is restored, so the caller may run the same worker again.
+    ///
     /// # Returns
     ///
     /// `false`, immediately, if another thread is already running this worker.
@@ -978,6 +1058,20 @@ impl Pool {
             None => return false,
         };
 
+        let mut guard = RunGuard {
+            pool: self.as_ref(),
+            id: w.id,
+            queue: Some(queue),
+            mine: VecDeque::new(),
+        };
+        self.local[w.id]
+            .accepting_local
+            .store(true, Ordering::SeqCst);
+        let queue = guard
+            .queue
+            .as_ref()
+            .expect("run guard owns the worker deque");
+
         // **The worker's own work, in a queue nothing else can see.**
         //
         // This is the change that matters most in this whole pool. `queue` is
@@ -988,7 +1082,7 @@ impl Pool {
         // and only when somebody is asleep to receive it, which is the design
         // `forte`, `chili` and Spice all arrived at: pay for sharing on a
         // timer, not on every task.
-        let mut mine: VecDeque<Job> = VecDeque::new();
+        let mine = &mut guard.mine;
         // A countdown rather than a modulus. `tick % promote_every` is a
         // runtime `u64` remainder on the hot path for a value that only has to
         // reach zero, and it made the interval depend on an absolute count,
@@ -1030,7 +1124,7 @@ impl Pool {
                 self.publish_capped_slot(w.id, !mine.is_empty() || !queue.is_empty());
             }
             if slot_budget_exhausted && self.tuning.share_displaced {
-                self.take_from_injector(&mut mine);
+                self.take_from_injector(mine);
             }
             lifo_run = 0;
 
@@ -1040,7 +1134,7 @@ impl Pool {
                 until_promote -= 1;
                 if until_promote == 0 {
                     until_promote = self.tuning.promote_every;
-                    self.promote(&mut mine, &queue, w.id);
+                    self.promote(mine, queue, w.id);
                 }
                 job.run();
                 self.local[w.id].completed.fetch_add(1, Ordering::Relaxed);
@@ -1116,7 +1210,7 @@ impl Pool {
                 }
             };
             if may_search {
-                let stolen = self.steal_once(&queue, w.id, &mut rng);
+                let stolen = self.steal_once(queue, w.id, &mut rng);
                 if workers >= 2 {
                     self.searching.fetch_sub(1, Ordering::AcqRel);
                 }
@@ -1128,7 +1222,7 @@ impl Pool {
 
             // 4. What arrived from outside. Last, because it is the queue every
             //    worker contends on.
-            if self.take_from_injector(&mut mine) > 0 {
+            if self.take_from_injector(mine) > 0 {
                 spins = 0;
                 // **Share at the refill, not only on the countdown.** A batch
                 // off the injector is the one moment this worker is known to
@@ -1148,7 +1242,7 @@ impl Pool {
                 // So the refill always publishes half. That half costs a
                 // compare-exchange to take back if nobody steals it, which is
                 // the price of it being reachable at all.
-                self.share(&mut mine, &queue, w.id);
+                self.share(mine, queue, w.id);
                 until_promote = self.tuning.promote_every;
                 continue;
             }
@@ -1202,7 +1296,7 @@ impl Pool {
             // Announce before the final check, including work another worker
             // published after our last steal attempt but before seeing our bit.
             let bit = 1usize << w.id;
-            if !self.prepare_to_park(&queue, w.id, &mut rng) {
+            if !self.prepare_to_park(queue, w.id, &mut rng) {
                 continue;
             }
             // Checked before parking so a worker cannot sleep through the end;
@@ -1221,12 +1315,9 @@ impl Pool {
         // everyone else, so it goes back where another worker can reach it.
         // Shutdown makes no promise that it runs, but losing it silently is a
         // different thing from not running it.
-        for job in mine {
-            self.injector.push(job);
-        }
-
+        //
         // Put it back, so a caller that restarts this worker finds its deque.
-        self.local[w.id].put_queue(queue);
+        drop(guard);
         true
     }
 
@@ -1296,6 +1387,9 @@ impl Pool {
     fn prepare_to_park(&self, queue: &Queue<Job>, id: usize, rng: &mut u64) -> bool {
         let bit = 1usize << id;
         self.sleeping.fetch_or(bit, Ordering::SeqCst);
+        // Pair sleep publication with publishers' fences before checking
+        // sources whose loads are weaker than SeqCst.
+        fence(Ordering::SeqCst);
         if !self.injector.is_empty()
             || !self.local[id].inbox.is_empty()
             || self.local[id].lifo.is_some()
@@ -1521,6 +1615,8 @@ mod wake_distribution {
             host.clone(),
             Tuning::locality().with_stealable_inbox(true),
         );
+        // Model an active owner without entering its run loop.
+        pool.local[0].accepting_local.store(true, Ordering::SeqCst);
         pool.sleeping.store(1 << 1, Ordering::SeqCst);
         pool.submit_local(0, super::Job::from_boxed(|| {}));
         assert!(host.unparked.lock().unwrap().is_empty());
@@ -1547,6 +1643,8 @@ mod wake_distribution {
                 .with_stealable_inbox(true)
                 .with_lifo_run_limit(3),
         );
+        // Model an active owner without entering its run loop.
+        pool.local[0].accepting_local.store(true, Ordering::SeqCst);
         let thief = pool.local[1].take_queue().unwrap();
         pool.sleeping.store(1 << 1, Ordering::SeqCst);
         pool.submit_local(0, super::Job::from_boxed(|| {}));
@@ -1566,6 +1664,8 @@ mod wake_distribution {
                 unparked: Mutex::new(Vec::new()),
             });
             let pool = Pool::with_tuning(2, 64, host.clone(), Tuning::almost_tokio());
+            // Model an active owner without entering its run loop.
+            pool.local[0].accepting_local.store(true, Ordering::SeqCst);
             pool.submit_local(0, super::Job::from_boxed(|| {}));
             if !private_backlog {
                 // A second task displaces the first into the shared inbox.
@@ -1604,6 +1704,8 @@ mod wake_distribution {
             host.clone(),
             Tuning::locality().with_share_displaced(true),
         );
+        // Model an active owner without entering its run loop.
+        pool.local[0].accepting_local.store(true, Ordering::SeqCst);
         pool.sleeping.store(1 << 1, Ordering::SeqCst);
         pool.submit_local(0, super::Job::from_boxed(|| {}));
         pool.submit_local(0, super::Job::from_boxed(|| {}));
@@ -1653,6 +1755,8 @@ mod wake_distribution {
                 .with_share_displaced(true)
                 .with_lifo_run_limit(4),
         );
+        // Model an active owner without entering its run loop.
+        pool.local[0].accepting_local.store(true, Ordering::SeqCst);
         let done = Arc::new(AtomicBool::new(false));
         let polls = Arc::new(AtomicUsize::new(0));
         pool.submit_local(0, retry(Arc::downgrade(&pool), done.clone(), polls.clone()));
@@ -1805,6 +1909,10 @@ mod wake_distribution {
             unparked: Mutex::new(Vec::new()),
         });
         let pool = Pool::with_tuning(WORKERS, 64, host.clone(), Tuning::locality());
+        // Model an active owner without entering its run loop.
+        pool.local[HOLDER]
+            .accepting_local
+            .store(true, Ordering::SeqCst);
         pool.sleeping
             .store((1usize << WORKERS) - 1, Ordering::SeqCst);
 

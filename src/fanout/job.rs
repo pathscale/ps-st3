@@ -71,6 +71,10 @@ impl Job {
     ///
     /// One allocation, and the function that runs it is monomorphised for `F`,
     /// so there is no vtable and no second indirection at run time.
+    ///
+    /// A panic from `work` propagates through the worker's run call. With
+    /// unwinding enabled, the pool preserves pending work and restores the
+    /// worker's deque before the panic reaches the caller.
     pub fn from_boxed<F>(work: F) -> Self
     where
         F: FnOnce() + Send + 'static,
@@ -117,8 +121,8 @@ impl Job {
     ///   when that is, and a job may outlive the thread that submitted it.
     /// * The work behind `pointer` is `Send`, because the job will very likely
     ///   run on a different thread.
-    /// * `handle` does not unwind. A panic crossing a worker's run loop takes
-    ///   the worker's deque with it.
+    /// * `handle` does not unwind, for either action. The pool's unwind cleanup
+    ///   does not relax this raw callback contract.
     /// * This job is the only one naming `pointer`, since running consumes the
     ///   pointer's ownership.
     // Not `const`: a function pointer in a `const fn` is 1.61, and this crate

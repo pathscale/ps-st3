@@ -48,6 +48,7 @@ pub(crate) unsafe fn transfer_items<T>(
     dst_pos: UnsignedShort,
     count: UnsignedShort,
 ) {
+    let () = UnsafeCell::<MaybeUninit<T>>::SIZE_ASSERT;
     let cap = src_mask as usize + 1;
     let dcap = dst_mask as usize + 1;
     let src_idx = (src_pos & src_mask) as usize;
@@ -57,6 +58,8 @@ pub(crate) unsafe fn transfer_items<T>(
     debug_or_loom_assert!(cap == src_buffer.len() && dcap == dst_buffer.len());
     debug_or_loom_assert!(cap.is_power_of_two() && dcap.is_power_of_two());
 
+    // The transparent wrapper and MaybeUninit preserve T's layout, so
+    // casting the buffer pointers preserves element alignment and stride.
     let src_base = src_buffer.as_ptr().cast::<T>();
     let dst_base = dst_buffer.as_ptr().cast::<T>() as *mut T;
 

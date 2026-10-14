@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
@@ -40,6 +42,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -62,6 +66,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -78,6 +84,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -96,6 +104,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable

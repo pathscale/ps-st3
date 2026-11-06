@@ -1,5 +1,6 @@
 [package]
 name = "ps-st3"
+publish = ["crates-io"]
 # When incrementing version and releasing to crates.io:
 # - Update crate version in README.md
 # - Update CHANGELOG.md

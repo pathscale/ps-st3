@@ -1,9 +1,9 @@
 # Local prepublish checklist
 
-Before manually dispatching `Publish crate` from `main`, review the exact
-commit, run the applicable local checks below, and run
-`cargo publish --dry-run`. Attest the full reviewed commit SHA and successful
-checks in the workflow inputs. Publishing does not run the test suite remotely.
+Before manually dispatching `Publish crate` from `master`, review the change
+and run the applicable local checks below, including
+`cargo publish --dry-run`. The workflow publishes the version declared in
+`Cargo.toml`; it does not run the test suite remotely.
 
 The existing manual CI requirements are:
 
@@ -18,7 +18,5 @@ The existing manual CI requirements are:
 - Run `cargo fmt --all -- --check`, `cargo clippy`, and
   `RUSTDOCFLAGS='-Dwarnings' cargo doc --no-deps --document-private-items`.
 
-The previous publish workflow also gated publication on
-`cargo test --release --features host`; retain that check for every release.
 If a code change affects queue algorithms, unsafe transfer paths, or fanout
-wake behavior, run the Loom checks against that change before attesting.
+wake behavior, run the Loom checks against that change before publishing.

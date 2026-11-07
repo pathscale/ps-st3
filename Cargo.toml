@@ -1,11 +1,7 @@
 [package]
 name = "ps-st3"
 publish = ["crates-io"]
-# When incrementing version and releasing to crates.io:
-# - Update crate version in README.md
-# - Update CHANGELOG.md
-# - Update if necessary copyright notice in LICENSE-MIT
-# - Create a "vX.Y.Z" git tag
+# Cargo.toml is the crates.io release version authority.
 version = "0.6.3"
 authors = ["Serge Barral <serge.barral@asynchronics.com>"]
 edition = "2021"

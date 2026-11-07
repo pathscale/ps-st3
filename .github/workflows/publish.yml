@@ -12,10 +12,13 @@ concurrency:
 
 jobs:
   publish:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/master'
     runs-on: ubicloud-standard-2
     timeout-minutes: 15
     steps:
+      - name: Require master
+        shell: bash
+        run: test "$GITHUB_REF" = refs/heads/master
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false

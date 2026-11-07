@@ -30,10 +30,16 @@ pub(crate) mod cell {
 #[cfg(not(all(test, st3_loom)))]
 pub(crate) mod cell {
     #[derive(Debug)]
+    #[repr(transparent)]
     pub(crate) struct UnsafeCell<T>(core::cell::UnsafeCell<T>);
 
     #[allow(dead_code)]
     impl<T> UnsafeCell<T> {
+        /// Check the element stride used by bulk ring-buffer transfers.
+        pub(crate) const SIZE_ASSERT: () = {
+            assert!(core::mem::size_of::<Self>() == core::mem::size_of::<T>());
+        };
+
         pub(crate) fn new(data: T) -> UnsafeCell<T> {
             UnsafeCell(core::cell::UnsafeCell::new(data))
         }

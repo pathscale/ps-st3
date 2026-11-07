@@ -420,13 +420,19 @@ fn stealable_inbox_drains_behind_a_blocked_owner_exactly_once() {
             resume.recv_timeout(Duration::from_secs(10)).unwrap();
         }),
     );
-    let threads: Vec<_> = (0..4)
+    // Start worker 0 alone so it takes the blocker from the shared injector.
+    let owner = {
+        let pool = pool.clone();
+        std::thread::spawn(move || assert!(pool.run(pool.runner(0))))
+    };
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let threads: Vec<_> = (1..4)
         .map(|id| {
             let pool = pool.clone();
             std::thread::spawn(move || assert!(pool.run(pool.runner(id))))
         })
         .collect();
-    ready.recv_timeout(Duration::from_secs(5)).unwrap();
     let counts: Arc<Vec<AtomicUsize>> = Arc::new((0..2000).map(|_| AtomicUsize::new(0)).collect());
     let (finished, completed) = mpsc::channel();
     for id in 0..counts.len() {
@@ -449,9 +455,11 @@ fn stealable_inbox_drains_behind_a_blocked_owner_exactly_once() {
     release.send(()).unwrap();
     completed.recv_timeout(Duration::from_secs(5)).unwrap();
     pool.shut_down();
+    owner.join().unwrap();
     for worker in threads {
         worker.join().unwrap();
     }
+    assert_eq!(pool.completed(0), 2, "owner must run the blocker and warm job");
     assert!(counts
         .iter()
         .all(|count| count.load(Ordering::Relaxed) == 1));

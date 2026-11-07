@@ -1,6 +1,6 @@
 # Local prepublish checklist
 
-Before manually dispatching `Publish crate` from `master`, review the change
+Before manually dispatching `Publish crate` from `main`, review the change
 and run the applicable local checks below, including
 `cargo publish --dry-run`. The workflow publishes the version declared in
 `Cargo.toml`; it does not run the test suite remotely.

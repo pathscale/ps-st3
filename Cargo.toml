@@ -2,7 +2,7 @@
 name = "ps-st3"
 publish = ["crates-io"]
 # Cargo.toml is the crates.io release version authority.
-version = "0.6.3"
+version = "0.6.4"
 authors = ["Serge Barral <serge.barral@asynchronics.com>"]
 edition = "2021"
 rust-version = "1.60"
